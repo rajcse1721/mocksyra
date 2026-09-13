@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: mocksyra-realtime
+    runtime: node
+    plan: free
+    region: singapore
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_VERSION
+        value: 22
+      - key: FRONTEND_ORIGIN
+        sync: false
+      - key: APP_URL
+        sync: false
+      - key: SUPABASE_SECRET_KEY
+        sync: false

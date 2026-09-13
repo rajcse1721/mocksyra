@@ -1,0 +1,8 @@
+node_modules/
+.npm-cache/
+data/*.json
+data/*.jsonl
+.env
+.env.*
+!.env.example
+npm-debug.log*

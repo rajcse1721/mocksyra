@@ -1,0 +1,19 @@
+.call-stage { display:flex; flex-direction:column; min-height:520px; }
+.call-users { flex:1; min-height:0; margin-top:24px; }
+.video { height:auto; min-height:330px; position:relative; overflow:hidden; border-radius:8px; background:#27534b; }
+.video video { display:block; width:100%; height:100%; object-fit:cover; background:#21463f; }
+.video small { position:absolute; z-index:1; left:12px; bottom:12px; padding:6px 9px; border-radius:4px; color:#fff; background:rgba(14,42,37,.78); font:10px 'DM Mono',monospace; }
+.call-top { padding-bottom:12px; border-bottom:1px solid #42675f; }
+.call-controls { position:static; transform:none; justify-content:center; margin:18px auto 0; }
+.call-action { min-width:108px; display:inline-flex; align-items:center; justify-content:center; gap:8px; border:1px solid #688780; border-radius:6px; padding:11px 14px; background:#345f57; color:#fff; font:700 12px Manrope,Arial,sans-serif; cursor:pointer; }
+.call-action:hover { background:#426e65; }
+.call-action b { display:grid; width:18px; height:18px; place-items:center; font-size:15px; }
+.call-action#mic b { font-size:0; }
+.call-action#mic b::after { content:'🎙'; font-size:16px; line-height:1; }
+.call-action.off { background:#815149; border-color:#a7675d; }
+.call-action.end { background:var(--coral); border-color:var(--coral); color:var(--ink); }
+.call-action.end:hover { background:#ff947f; }
+.connection-banner { display:flex; align-items:center; gap:9px; margin:14px 0 0; color:#b9cec7; font:10px 'DM Mono',monospace; }
+.connection-banner i { width:8px; height:8px; border-radius:50%; background:#ffcc65; }
+.connection-banner.ready i { background:var(--lime); }
+@media (max-width:700px) { .call-stage { min-height:650px; } .call-users { grid-template-rows:1fr 1fr; } .video { min-height:220px; } }
