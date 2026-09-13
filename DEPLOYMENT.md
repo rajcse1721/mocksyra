@@ -10,6 +10,10 @@ Mocksyra uses Netlify for the static frontend, Render for the Socket.IO/WebRTC s
 4. Never place this secret in `supabase.js`, Git, Netlify, screenshots, or chat. It belongs only in Render's secret environment variables.
 5. In Authentication -> URL Configuration, add the final Netlify URL as the Site URL and add `https://YOUR-SITE.netlify.app/**` as a redirect URL.
 
+### Enable Google sign-in
+
+The site includes a **Continue with Google** button. To activate it, create a Google OAuth web client, add Supabase's callback URL (`https://YOUR-PROJECT.supabase.co/auth/v1/callback`) as its authorized redirect URI, then paste the Google client ID and secret in **Supabase Dashboard -> Authentication -> Providers -> Google**. Keep the Netlify URL in Supabase's URL Configuration from step 5. The Google client secret belongs only in Supabase, never in this repository or Netlify.
+
 ## 2. Deploy the Render backend
 
 1. Push this directory to a private or public GitHub repository.

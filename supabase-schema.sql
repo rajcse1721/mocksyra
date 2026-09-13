@@ -10,6 +10,7 @@ create table if not exists public.profiles (
   interview_type text,
   experience_level text,
   spoken_language text,
+  practice_mode text not null default 'peer' check (practice_mode in ('peer', 'candidate', 'interviewer')),
   timezone text,
   created_at timestamptz default now(),
   updated_at timestamptz default now()
@@ -19,6 +20,7 @@ alter table public.profiles add column if not exists availability jsonb default 
 alter table public.profiles add column if not exists interview_type text;
 alter table public.profiles add column if not exists experience_level text;
 alter table public.profiles add column if not exists spoken_language text;
+alter table public.profiles add column if not exists practice_mode text not null default 'peer' check (practice_mode in ('peer', 'candidate', 'interviewer'));
 alter table public.profiles add column if not exists timezone text;
 alter table public.profiles enable row level security;
 

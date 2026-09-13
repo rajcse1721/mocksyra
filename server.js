@@ -3,6 +3,7 @@ const fs = require('fs');
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
+const { PRACTICE_MODES, HALF_SESSION_MS, practiceMode, compatibleModes, sessionMode, sessionDetails, currentQuestion, isParticipant, canUseRoom, validFeedback, feedbackWithCriteria, finishFeedback } = require('./session-rules');
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://qjghjsapizkqktcbczgj.supabase.co';
 const SUPABASE_PUBLISHABLE_KEY = process.env.SUPABASE_PUBLISHABLE_KEY || 'sb_publishable_LPppVZWRepW4yHykfUS2EQ_sH9dwksM';
@@ -34,7 +35,7 @@ function save() {
 
 async function saveRemoteState() {
   try {
-    await fetch(`${SUPABASE_URL}/rest/v1/app_state`, {
+    const response = await fetch(`${SUPABASE_URL}/rest/v1/app_state`, {
       method: 'POST',
       headers: {
         ...supabaseAdminHeaders(),
@@ -43,6 +44,7 @@ async function saveRemoteState() {
       },
       body: JSON.stringify({ id: 'primary', payload: db, updated_at: new Date().toISOString() })
     });
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
   } catch (error) { console.error('Supabase persistence failed:', error.message); }
 }
 
@@ -93,6 +95,7 @@ const questionBank = {
 
 const levels = ['Beginner', 'Intermediate', 'Advanced'];
 const online = new Map();
+const sessionTimers = new Map();
 
 function addOnline(email, socketId) {
   if (!online.has(email)) online.set(email, new Set());
@@ -126,6 +129,7 @@ function pruneQueue() {
 }
 
 function compatibility(a, b) {
+  if (!compatibleModes(a, b)) return null;
   const commonTimes = sharedSlots(a, b), commonSkills = sharedSkills(a, b);
   const languageCompatible = a.spokenLanguage === b.spokenLanguage || [a.spokenLanguage, b.spokenLanguage].includes('English + Hindi');
   if (!commonTimes.length || !commonSkills.length || a.interviewType !== b.interviewType || !languageCompatible) return null;
@@ -158,9 +162,9 @@ function questionFor(type, offset) {
 }
 
 function publicPeer(profile) {
-  return { name: profile.name, languages: profile.languages, experience: profile.experience, spokenLanguage: profile.spokenLanguage, sessionsCompleted: profile.stats?.sessionsCompleted || 0 };
+  return { name: profile.name, languages: profile.languages, experience: profile.experience, spokenLanguage: profile.spokenLanguage, practiceMode: practiceMode(profile), sessionsCompleted: profile.stats?.sessionsCompleted || 0 };
 }
-function publicMatch(match, email) {
+function publicMatch(match, email, now = Date.now()) {
   const peer = match.people.find(person => person.email !== email);
   return {
     roomId: match.id,
@@ -169,16 +173,72 @@ function publicMatch(match, email) {
     reasons: match.reasons,
     sharedSlot: match.sharedSlot,
     interviewType: match.interviewType,
-    startsAsInterviewer: match.people[0].email === email,
-    question: match.questions[email],
-    status: match.status
+    ...sessionDetails(match, email, now),
+    question: currentQuestion(match, email, now, questionFor(match.interviewType, 0)),
+    status: match.status,
+    selfFeedback: feedbackWithCriteria(match, email),
+    feedbackSubmitted: Boolean(match.feedback?.[email])
   };
 }
-function historyFor(email) {
-  return Object.values(db.matches).filter(match => match.status === 'completed' && match.people.some(person => person.email === email)).sort((a, b) => new Date(b.completedAt) - new Date(a.completedAt)).slice(0, 25).map(match => {
+function historyFor(email, matches = db.matches) {
+  return Object.values(matches).filter(match => match.status === 'completed' && match.people.some(person => person.email === email)).sort((a, b) => new Date(b.completedAt) - new Date(a.completedAt)).slice(0, 25).map(match => {
     const peer = match.people.find(person => person.email !== email);
-    return { roomId: match.id, peer: publicPeer(peer), interviewType: match.interviewType, sharedSlot: match.sharedSlot, completedAt: match.completedAt, feedbackReceived: match.feedback[peer.email] || null };
+    const details = sessionDetails(match, email);
+    return { roomId: match.id, peer: publicPeer(peer), interviewType: match.interviewType, sharedSlot: match.sharedSlot, completedAt: match.completedAt, practiceMode: details.practiceMode, sessionMode: details.sessionMode, durationMinutes: details.durationMinutes, peerRole: details.peerRole, feedbackCriteria: details.receivedFeedbackCriteria, feedbackReceived: feedbackWithCriteria(match, peer.email) };
   });
+}
+
+function profileStateFor(email) {
+  const profile = db.profiles[email];
+  const active = activeMatchFor(email);
+  return {
+    profile: profile ? { ...profile, practiceMode: practiceMode(profile) } : null,
+    activeMatch: active ? publicMatch(active, email) : null,
+    history: historyFor(email),
+    notifications: db.notifications.filter(item => item.email === email).slice(-20).reverse()
+  };
+}
+
+function clearSessionTimers(roomId) {
+  for (const timer of sessionTimers.get(roomId) || []) clearTimeout(timer);
+  sessionTimers.delete(roomId);
+}
+
+function emitSessionState(match, event) {
+  match.people.forEach(person => emitToEmail(person.email, event, { roomId: match.id, ...sessionDetails(match, person.email), question: currentQuestion(match, person.email, Date.now(), questionFor(match.interviewType, 0)) }));
+}
+
+function finishSession(match) {
+  if (match.status !== 'in_progress') return false;
+  match.status = 'feedback_pending';
+  match.sessionEndedAt = new Date().toISOString();
+  clearSessionTimers(match.id);
+  save();
+  match.people.forEach(person => emitToEmail(person.email, 'session-ended', { roomId: match.id }));
+  return true;
+}
+
+function scheduleSessionTimers(match) {
+  clearSessionTimers(match.id);
+  if (match.status !== 'in_progress' || !match.sessionStartedAt) return;
+  const started = Date.parse(match.sessionStartedAt);
+  if (!Number.isFinite(started)) return;
+  const duration = sessionMode(match) === 'directed' ? HALF_SESSION_MS : HALF_SESSION_MS * 2;
+  const remaining = started + duration - Date.now();
+  if (remaining <= 0) { finishSession(match); return; }
+  const timers = [];
+  if (duration === HALF_SESSION_MS * 2 && started + HALF_SESSION_MS > Date.now()) {
+    timers.push(setTimeout(() => { if (match.status === 'in_progress') emitSessionState(match, 'session-phase'); }, started + HALF_SESSION_MS - Date.now()));
+  }
+  timers.push(setTimeout(() => finishSession(match), remaining));
+  timers.forEach(timer => timer.unref());
+  sessionTimers.set(match.id, timers);
+}
+
+function acknowledge(callback, packet) { if (typeof callback === 'function') callback(packet); }
+function reject(socket, callback, error) {
+  acknowledge(callback, { ok: false, error });
+  if (typeof callback !== 'function') socket.emit('app-error', error);
 }
 
 async function sendEmail(profile, title, body) {
@@ -205,7 +265,7 @@ function notify(profile, title, body, matchId) {
 
 function authorizedMatch(socket, roomId) {
   const match = db.matches[cleanText(roomId, 100)];
-  return match?.people.some(person => person.email === socket.data.email) ? match : null;
+  return isParticipant(match, socket.data.email) ? match : null;
 }
 function roomParticipantEmails(roomId) {
   const members = io.sockets.adapter.rooms.get(roomId) || new Set();
@@ -214,7 +274,7 @@ function roomParticipantEmails(roomId) {
 function validRoomPacket(socket, packet) {
   const roomId = cleanText(packet?.roomId, 100);
   const match = authorizedMatch(socket, roomId);
-  return match && socket.rooms.has(roomId) ? { match, roomId } : null;
+  return canUseRoom(match, socket.data.email, socket.rooms.has(roomId)) ? { match, roomId } : null;
 }
 
 io.use(async (socket, next) => {
@@ -236,15 +296,20 @@ io.on('connection', socket => {
   addOnline(email, socket.id);
 
   socket.on('restore-profile', () => {
-    const active = activeMatchFor(email);
-    if (active) socket.emit('match-found', publicMatch(active, email));
-    socket.emit('notifications', db.notifications.filter(item => item.email === email).slice(-20).reverse());
-    socket.emit('history', historyFor(email));
+    const state = profileStateFor(email);
+    socket.emit('profile-state', state);
+    if (state.activeMatch) socket.emit('match-found', state.activeMatch);
+    socket.emit('notifications', state.notifications);
+    socket.emit('history', state.history);
   });
 
-  socket.on('find-match', input => {
+  socket.on('find-match', (input, callback) => {
     const active = activeMatchFor(email);
-    if (active) return socket.emit('match-found', publicMatch(active, email));
+    if (active) {
+      acknowledge(callback, { ok: true, activeMatch: publicMatch(active, email) });
+      return socket.emit('match-found', publicMatch(active, email));
+    }
+    if (input?.practiceMode != null && !PRACTICE_MODES.includes(input.practiceMode)) return reject(socket, callback, 'Choose peer practice, candidate, or interviewer mode.');
     const oldStats = db.profiles[email]?.stats || { sessionsCompleted: 0, ratingTotal: 0, averageRating: 0 };
     const profile = {
       email,
@@ -254,15 +319,18 @@ io.on('connection', socket => {
       interviewType: questionBank[input?.interviewType] ? input.interviewType : '',
       experience: levels.includes(input?.experience) ? input.experience : 'Beginner',
       spokenLanguage: ['English', 'Hindi', 'English + Hindi'].includes(input?.spokenLanguage) ? input.spokenLanguage : 'English',
+      practiceMode: practiceMode(input),
       timezone: cleanText(input?.timezone, 60),
       status: 'waiting',
       stats: oldStats,
       updatedAt: new Date().toISOString()
     };
-    if (!profile.name || !profile.languages.length || !profile.slots.length || !profile.interviewType) return socket.emit('app-error', 'Please complete all matching preferences.');
+    if (!profile.name || !profile.languages.length || !profile.slots.length || !profile.interviewType) return reject(socket, callback, 'Please complete all matching preferences.');
+    if (profile.slots.some(slot => !Number.isFinite(Date.parse(slot)) || Date.parse(slot) <= Date.now())) return reject(socket, callback, 'Choose an upcoming session time. Your previous time may have passed.');
+    profile.slots = [...new Set(profile.slots.map(slot => new Date(slot).toISOString()))];
     db.profiles[email] = profile;
     const found = bestMatch(profile);
-    if (!found) { save(); return socket.emit('match-waiting'); }
+    if (!found) { save(); acknowledge(callback, { ok: true, waiting: true, profile }); return socket.emit('match-waiting'); }
 
     const roomId = `room-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const match = {
@@ -272,6 +340,8 @@ io.on('connection', socket => {
       reasons: found.result.reasons,
       sharedSlot: found.result.sharedSlot,
       interviewType: profile.interviewType,
+      sessionMode: profile.practiceMode === 'peer' ? 'peer' : 'directed',
+      durationMinutes: profile.practiceMode === 'peer' ? 90 : 45,
       status: 'matched',
       createdAt: new Date().toISOString(),
       questions: { [profile.email]: questionFor(profile.interviewType, 0), [found.candidate.email]: questionFor(profile.interviewType, 1) },
@@ -283,6 +353,7 @@ io.on('connection', socket => {
     db.profiles[profile.email].status = 'matched';
     db.profiles[found.candidate.email].status = 'matched';
     save();
+    acknowledge(callback, { ok: true, activeMatch: publicMatch(match, email) });
     match.people.forEach(person => {
       const peer = match.people.find(other => other.email !== person.email);
       notify(person, 'Your Mocksyra match is ready', `You matched with ${peer.name} for ${match.interviewType} at the same available time.`, roomId);
@@ -290,13 +361,33 @@ io.on('connection', socket => {
     });
   });
 
-  socket.on('cancel-search', () => {
+  socket.on('cancel-search', callback => {
+    if (activeMatchFor(email)) return reject(socket, callback, 'A match is already ready. Open it to join or cancel.');
     if (db.profiles[email]?.status === 'waiting') { db.profiles[email].status = 'idle'; save(); }
+    acknowledge(callback, { ok: true });
   });
 
-  socket.on('join-session', roomIdValue => {
+  socket.on('cancel-match', (roomIdValue, callback) => {
+    const roomId = cleanText(typeof roomIdValue === 'object' ? roomIdValue?.roomId : roomIdValue, 100);
+    const match = authorizedMatch(socket, roomId);
+    if (!canUseRoom(match, email, false, 'cancel')) return reject(socket, callback, 'Only a match that has not started can be cancelled.');
+    match.status = 'cancelled';
+    match.cancelledAt = new Date().toISOString();
+    clearSessionTimers(roomId);
+    match.people.forEach(person => {
+      if (db.profiles[person.email]?.status === 'matched') db.profiles[person.email].status = 'idle';
+    });
+    save();
+    match.people.forEach(person => emitToEmail(person.email, 'match-cancelled', { roomId, message: 'This match was cancelled. You can choose new preferences and find another match.' }));
+    io.in(roomId).socketsLeave(roomId);
+    acknowledge(callback, { ok: true });
+  });
+
+  socket.on('join-session', (roomIdValue, callback) => {
     const roomId = cleanText(roomIdValue, 100), match = authorizedMatch(socket, roomId);
-    if (!match || match.status === 'completed') return socket.emit('app-error', 'This interview room is unavailable.');
+    if (!match || !['matched', 'in_progress'].includes(match.status)) return reject(socket, callback, 'This interview room is unavailable.');
+    if (match.status === 'in_progress') scheduleSessionTimers(match);
+    if (match.status !== 'matched' && match.status !== 'in_progress') return reject(socket, callback, 'This interview has ended. Please share your feedback.');
     socket.join(roomId);
     const peer = match.people.find(person => person.email !== email);
     emitToEmail(peer.email, 'peer-entered-room');
@@ -304,8 +395,19 @@ io.on('connection', socket => {
     if (participants.size >= 2) {
       if (!match.sessionStartedAt) match.sessionStartedAt = new Date().toISOString();
       match.status = 'in_progress'; save();
-      io.to(roomId).emit('session-ready', { startedAt: match.sessionStartedAt });
+      scheduleSessionTimers(match);
+      emitSessionState(match, 'session-ready');
     }
+    acknowledge(callback, { ok: true, ...sessionDetails(match, email), question: currentQuestion(match, email, Date.now(), questionFor(match.interviewType, 0)) });
+  });
+
+  socket.on('leave-session', (roomIdValue, callback) => {
+    const roomId = cleanText(typeof roomIdValue === 'object' ? roomIdValue?.roomId : roomIdValue, 100);
+    const match = authorizedMatch(socket, roomId);
+    if (!match) return reject(socket, callback, 'This interview room is unavailable.');
+    socket.leave(roomId);
+    if (!roomParticipantEmails(roomId).has(email)) socket.to(roomId).emit('peer-left', { roomId });
+    acknowledge(callback, { ok: true });
   });
 
   socket.on('signal', packet => {
@@ -316,7 +418,7 @@ io.on('connection', socket => {
 
   socket.on('workspace-request', roomIdValue => {
     const roomId = cleanText(roomIdValue, 100), match = authorizedMatch(socket, roomId);
-    if (!match || !socket.rooms.has(roomId)) return;
+    if (!canUseRoom(match, email, socket.rooms.has(roomId))) return;
     socket.emit('workspace-state', match.workspace || { code: '', language: 'JavaScript', version: 0 });
     socket.emit('chat-state', match.chat || []);
   });
@@ -336,57 +438,62 @@ io.on('connection', socket => {
     valid.match.chat = [...(valid.match.chat || []), item].slice(-50); save(); io.to(valid.roomId).emit('chat-message', item);
   });
 
-  socket.on('complete-session', roomIdValue => {
+  socket.on('complete-session', (roomIdValue, callback) => {
     const roomId = cleanText(roomIdValue, 100), match = authorizedMatch(socket, roomId);
-    if (!match || match.status === 'completed') return;
-    match.status = 'feedback_pending'; match.sessionEndedAt = new Date().toISOString(); save();
-    io.to(roomId).emit('session-ended');
+    if (isParticipant(match, email) && ['feedback_pending', 'completed'].includes(match.status)) return acknowledge(callback, { ok: true, ended: true });
+    if (!canUseRoom(match, email, socket.rooms.has(roomId), 'finish')) return reject(socket, callback, 'Both participants must join before finishing an interview.');
+    finishSession(match);
+    acknowledge(callback, { ok: true, ended: true });
   });
 
-  socket.on('submit-feedback', packet => {
+  socket.on('submit-feedback', (packet, callback) => {
     const match = authorizedMatch(socket, packet?.roomId);
-    if (!match || !['feedback_pending', 'in_progress'].includes(match.status)) return socket.emit('app-error', 'Feedback is not open for this interview.');
-    const scores = Array.isArray(packet.feedback?.scores) ? packet.feedback.scores.map(value => Math.max(1, Math.min(5, Number(value) || 0))).slice(0, 3) : [];
-    const feedback = { scores, strength: cleanText(packet.feedback?.strength, 1200), improve: cleanText(packet.feedback?.improve, 1200), practiseAgain: typeof packet.feedback?.practiseAgain === 'boolean' ? packet.feedback.practiseAgain : null, submittedAt: new Date().toISOString() };
-    if (scores.length !== 3 || scores.some(value => !value) || feedback.strength.length < 5 || feedback.improve.length < 5) return socket.emit('app-error', 'Please complete every feedback field.');
+    if (match && ['completed', 'feedback_pending'].includes(match.status) && match.feedback?.[email]) {
+      return acknowledge(callback, { ok: true, submitted: true, completed: match.status === 'completed', selfFeedback: feedbackWithCriteria(match, email) });
+    }
+    if (!canUseRoom(match, email, false, 'feedback')) return reject(socket, callback, 'Feedback opens after this interview ends.');
+    const feedback = validFeedback(packet.feedback, sessionDetails(match, email).feedbackCriteria);
+    if (!feedback) return reject(socket, callback, 'Choose three ratings from 1 to 5, write at least five characters in each feedback field, and choose whether to practise again.');
+    match.feedback = match.feedback || {};
     match.feedback[email] = feedback; save();
     const peer = match.people.find(person => person.email !== email);
     emitToEmail(peer.email, 'peer-feedback-submitted');
-    if (!match.people.every(person => match.feedback[person.email])) return;
-
-    match.status = 'completed'; match.completedAt = new Date().toISOString();
-    match.people.forEach(person => {
-      const other = match.people.find(candidate => candidate.email !== person.email);
-      const received = match.feedback[other.email];
-      const profile = db.profiles[person.email];
-      const average = received.scores.reduce((sum, score) => sum + score, 0) / received.scores.length;
-      profile.stats = profile.stats || { sessionsCompleted: 0, ratingTotal: 0, averageRating: 0 };
-      profile.stats.sessionsCompleted += 1; profile.stats.ratingTotal += average; profile.stats.averageRating = profile.stats.ratingTotal / profile.stats.sessionsCompleted; profile.status = 'idle';
-    });
+    const completed = finishFeedback(match, db.profiles);
+    acknowledge(callback, { ok: true, submitted: true, completed, selfFeedback: feedback });
+    if (!completed) return;
     save();
     match.people.forEach(person => {
       const other = match.people.find(candidate => candidate.email !== person.email);
-      emitToEmail(person.email, 'feedback-ready', match.feedback[other.email]);
+      emitToEmail(person.email, 'feedback-ready', feedbackWithCriteria(match, other.email));
       emitToEmail(person.email, 'history', historyFor(person.email));
       notify(person, 'Your interview feedback is ready', 'Both feedback forms are in. Open Mocksyra to review and download your feedback.', match.id);
     });
   });
 
   socket.on('disconnecting', () => {
-    for (const roomId of socket.rooms) if (roomId !== socket.id) socket.to(roomId).emit('peer-left');
+    for (const roomId of socket.rooms) {
+      if (roomId === socket.id) continue;
+      const otherSession = [...(io.sockets.adapter.rooms.get(roomId) || [])].some(id => id !== socket.id && io.sockets.sockets.get(id)?.data.email === email);
+      if (!otherSession) socket.to(roomId).emit('peer-left', { roomId });
+    }
   });
   socket.on('disconnect', () => removeOnline(email, socket.id));
 });
 
-app.use(express.static(__dirname));
 app.get('/health', (_, response) => response.status(200).json({ status: 'ok', persistence: SUPABASE_SECRET_KEY ? 'supabase' : 'local' }));
-app.get('*', (_, response) => response.sendFile(path.join(__dirname, 'index.html')));
+const publicAssets = new Set(['index.html', 'styles.css', 'call.css', 'features.css', 'design.css', 'app.js', 'auth.js', 'supabase.js', 'runtime-config.js', 'site-config.js', 'runner.html', 'runner.js']);
+app.get('*', (request, response) => {
+  const asset = request.path === '/' ? 'index.html' : request.path.slice(1);
+  if (!publicAssets.has(asset)) return response.status(404).type('text').send('Not found');
+  response.sendFile(path.join(__dirname, asset));
+});
 
 const port = process.env.PORT || 3000;
 async function start() {
   await loadRemoteState();
+  Object.values(db.matches).forEach(scheduleSessionTimers);
   return server.listen(port, () => console.log(`Mocksyra is running at http://localhost:${port}`));
 }
 
 if (require.main === module) start();
-module.exports = { app, server, compatibility, sharedSlots, sharedSkills, questionFor };
+module.exports = { app, server, compatibility, sharedSlots, sharedSkills, questionFor, publicMatch, historyFor };
