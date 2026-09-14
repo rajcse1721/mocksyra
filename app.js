@@ -22,7 +22,10 @@ const state = {
   roomId: null,
   notifications: [],
   history: [],
+  listings: [],
+  serverNow: null,
   pendingCandidates: [],
+  dailyCall: null,
   workspace: { code: '', language: 'JavaScript', version: 0 },
   chat: [],
   selectedMode: sessionStorage.getItem('mocksyra-mode') || null,
@@ -39,6 +42,7 @@ const go = route => { location.hash = route; };
 const toast = (message, duration = 3200) => {
   const element = document.createElement('div');
   element.className = 'toast';
+  element.setAttribute('role', 'status'); element.setAttribute('aria-live', 'polite');
   element.textContent = message;
   document.body.append(element);
   setTimeout(() => element.remove(), duration);
@@ -48,12 +52,12 @@ const toast = (message, duration = 3200) => {
 const modes = {
   candidate: { title: 'Candidate', icon: 'user', duration: 45, target: 'an interviewer', description: 'Get comfortable answering questions. Receive focused feedback from a volunteer interviewer.' },
   interviewer: { title: 'Interviewer', icon: 'briefcase', duration: 45, target: 'a candidate', description: 'Lead a mock interview, share what you know, and build your interviewing skills.' },
-  peer: { title: 'Peer Practice', icon: 'users', duration: 90, target: 'a practice peer', description: 'Learn both sides. Interview each other and switch roles halfway through.' }
+  peer: { title: 'Peer Practice', icon: 'users', duration: 45, target: 'a practice peer', description: 'Learn both sides. Interview each other and switch roles halfway through.' }
 };
 const normalizedMode = value => modes[value] ? value : 'peer';
 const modeFor = () => modes[normalizedMode(state.match?.practiceMode || state.profile?.practiceMode)];
 const isPeerSession = () => !state.match?.sessionMode || state.match.sessionMode === 'peer';
-const sessionMinutes = () => Number(state.match?.durationMinutes) || (isPeerSession() ? 90 : 45);
+const sessionMinutes = () => Number(state.match?.durationMinutes) || 45;
 const closedMatch = match => !match || ['completed', 'cancelled', 'expired'].includes(match.status);
 const noteKey = () => `mocksyra-notes-${localStorage.getItem(EMAIL_KEY)}-${state.roomId}`;
 const icon = name => {
@@ -82,15 +86,13 @@ function frame(content) {
   const name = state.profile?.name || 'Your profile';
   const unread = state.notifications.filter(item => !item.read).length;
   return `<div class="app-shell">
-    <header class="app-nav"><div class="shell">
+    <header class="app-nav"><div class="shell app-nav-main">
       <a class="brand" href="#home"><i>◒</i> Mocksyra</a>
       <nav class="profile-menu" aria-label="Account">
-        <button class="text-button" data-route="onboarding">Find a session</button>
-        <button class="nav-activity" data-route="activity">Activity${unread ? `<span>${unread}</span>` : ''}</button>
         <span class="mini-avatar">${escapeHtml(name[0] || 'Y')}</span>
         <span>${escapeHtml(name)}</span><button class="text-button" id="logout">Log out</button>
       </nav>
-    </div></header><main class="app-main"><div class="shell">${content}</div></main></div>`;
+    </div><nav class="shell app-sections" aria-label="Practice"><button class="text-button" data-route="marketplace">Browse sessions</button><button class="text-button" data-route="onboarding">Offer a time</button><button class="nav-activity" data-route="activity">Activity${unread ? `<span>${unread}</span>` : ''}</button></nav></header><main class="app-main"><div class="shell">${content}</div></main></div>`;
 }
 function bindRoutes(scope = root) {
   scope.querySelectorAll('[data-route]').forEach(element => {
@@ -200,7 +202,7 @@ function onboarding() {
       <fieldset class="preference-fieldset"><legend class="field-label">When are you available?</legend><p class="field-help">Choose up to 3 start times. All times in ${escapeHtml(Intl.DateTimeFormat().resolvedOptions().timeZone)}.</p>
       <div class="slots" id="slots">${slots.map(slot => `<button type="button" class="slot ${selectedSlots.has(slot.value) ? 'selected' : ''}" data-value="${slot.value}" aria-pressed="${selectedSlots.has(slot.value)}">${escapeHtml(slot.label)}</button>`).join('')}</div></fieldset>
       <p id="preference-error" class="form-error" role="alert"></p>
-      <div class="form-actions"><span class="hint" id="selection-count"></span><button type="submit" class="button" id="find" ${currentMatch ? 'disabled' : ''}>Find my match ${icon('arrow')}</button></div>
+      <div class="form-actions marketplace-actions"><span class="hint" id="selection-count"></span><div><button type="submit" class="button secondary" id="auto-match" ${currentMatch ? 'disabled' : ''}>Match me automatically</button><button type="submit" class="button" id="publish" ${currentMatch ? 'disabled' : ''}>Publish & browse ${icon('arrow')}</button></div></div>
     </form><aside class="preference-aside"><section class="summary-card">
       <p class="eyebrow">YOUR NEXT SESSION</p><h2 id="summary-mode"></h2><p id="summary-description"></p>
       <dl class="session-summary"><div><dt>Session length</dt><dd id="summary-duration"></dd></div><div><dt>You’ll meet</dt><dd id="summary-partner"></dd></div><div><dt>Availability</dt><dd id="summary-times"></dd></div><div><dt>Cost</dt><dd>Free</dd></div></dl>
@@ -210,7 +212,7 @@ function onboarding() {
   const updateSummary = () => {
     const mode = modes[selectedMode];
     root.querySelector('#summary-mode').textContent = mode.title;
-    root.querySelector('#summary-description').textContent = selectedMode === 'peer' ? '45 minutes on each side of the table.' : selectedMode === 'candidate' ? 'Space to think, answer, and learn.' : 'Guide the conversation. Help someone grow.';
+    root.querySelector('#summary-description').textContent = selectedMode === 'peer' ? 'Switch roles halfway through one focused session.' : selectedMode === 'candidate' ? 'Space to think, answer, and learn.' : 'Guide the conversation. Help someone grow.';
     root.querySelector('#summary-duration').textContent = `${mode.duration} minutes`;
     root.querySelector('#summary-partner').textContent = mode.target;
     root.querySelector('#summary-times').textContent = `${selectedSlots.size} time${selectedSlots.size === 1 ? '' : 's'} selected`;
@@ -232,20 +234,26 @@ function onboarding() {
   });
   root.querySelector('#preferences-form').onsubmit = async event => {
     event.preventDefault();
-    const error = root.querySelector('#preference-error'), button = root.querySelector('#find');
+    const error = root.querySelector('#preference-error'), button = event.submitter || root.querySelector('#publish');
     const name = root.querySelector('#name').value.trim();
     if (!name || !selectedSkills.size || !selectedSlots.size) { error.textContent = 'Add your name, at least one technology, and a time to continue.'; return; }
     state.profile = { ...previous, name, practiceMode: selectedMode, languages: [...selectedSkills], slots: [...selectedSlots],
       interviewType: root.querySelector('#interview-type').value, experience: root.querySelector('#experience').value,
       spokenLanguage: root.querySelector('#spoken-language').value, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone };
     localStorage.setItem(PROFILE_KEY, JSON.stringify(state.profile));
-    button.disabled = true; button.textContent = 'Connecting…'; error.textContent = '';
-    if (!(await connectSocket())) { button.disabled = false; button.textContent = 'Try again'; error.textContent = 'Could not reach matching. Your preferences are saved.'; return; }
-    button.textContent = 'Finding your match…';
+    root.querySelectorAll('#preferences-form button[type="submit"]').forEach(item => { item.disabled = true; });
+    button.textContent = 'Connecting…'; error.textContent = '';
+    if (!(await connectSocket())) { root.querySelectorAll('#preferences-form button[type="submit"]').forEach(item => { item.disabled = false; }); button.textContent = 'Try again'; error.textContent = 'Could not reach sessions. Your preferences are saved.'; return; }
     saveProfileToSupabase(state.profile);
-    const result = await request('find-match', state.profile);
-    if (!result.ok) { button.disabled = false; button.textContent = 'Find my match'; error.textContent = result.error; return; }
-    if (location.hash === '#onboarding') go(closedMatch(state.match) ? 'search' : 'match');
+    const automatic = button.id === 'auto-match';
+    button.textContent = automatic ? 'Finding your best match…' : 'Publishing your times…';
+    const result = await request(automatic ? 'find-match' : 'publish-listing', state.profile);
+    if (!result.ok) { root.querySelectorAll('#preferences-form button[type="submit"]').forEach(item => { item.disabled = false; }); button.textContent = 'Try again'; error.textContent = result.error; return; }
+    if (result.listings) state.listings = result.listings;
+    if (result.profile) { state.profile = { ...state.profile, ...result.profile }; localStorage.setItem(PROFILE_KEY, JSON.stringify(state.profile)); }
+    if (result.serverNow) state.serverNow = result.serverNow;
+    if (result.activeMatch) { state.match = result.activeMatch; state.roomId = result.activeMatch.roomId; return go('match'); }
+    if (location.hash === '#onboarding') go(automatic ? 'search' : 'marketplace');
   };
   updateSummary();
 }
@@ -261,6 +269,118 @@ async function saveProfileToSupabase(profile) {
       updated_at: new Date().toISOString()
     });
   } catch { /* Realtime matching still works if optional profile sync fails. */ }
+}
+
+function marketplaceTitle(mode) {
+  if (mode === 'candidate') return { title: 'Available interviewers', context: 'Browsing as a candidate · showing interviewer availability' };
+  if (mode === 'interviewer') return { title: 'Candidate requests', context: 'Browsing as an interviewer · showing candidates who want to practise' };
+  return { title: 'Available peer sessions', context: 'Browsing for peer practice · both participants switch roles' };
+}
+
+function dateInputValue(value) {
+  const date = new Date(value);
+  const pad = part => String(part).padStart(2, '0');
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+}
+
+async function refreshMarketplace(showLoading = true) {
+  const results = root.querySelector('#marketplace-results');
+  if (showLoading && results) { results.setAttribute('aria-busy', 'true'); results.innerHTML = '<p class="empty-state">Refreshing available sessions…</p>'; }
+  if (!(await connectSocket())) {
+    if (results) results.innerHTML = '<p class="empty-state" role="alert">Could not reach the session marketplace. Please try again.</p>';
+    return;
+  }
+  const response = await request('browse-listings', {});
+  if (!response.ok) {
+    if (results) results.innerHTML = `<p class="empty-state" role="alert">${escapeHtml(response.error)}</p>`;
+    return;
+  }
+  state.listings = response.listings || [];
+  state.serverNow = response.serverNow || state.serverNow;
+  renderMarketplaceResults();
+}
+
+function renderMarketplaceResults() {
+  const results = root.querySelector('#marketplace-results');
+  if (!results) return;
+  const technology = root.querySelector('#filter-technology')?.value || '';
+  const type = root.querySelector('#filter-type')?.value || '';
+  const language = root.querySelector('#filter-language')?.value || '';
+  const date = root.querySelector('#filter-date')?.value || '';
+  const sort = root.querySelector('#marketplace-sort')?.value || 'soonest';
+  let sessions = state.listings.flatMap(listing => (listing.slots || []).map(slot => ({ ...listing, slot }))).filter(listing =>
+    (!technology || listing.languages.includes(technology)) && (!type || listing.interviewType === type) &&
+    (!language || listing.spokenLanguage === language) && (!date || dateInputValue(listing.slot) === date)
+  );
+  sessions.sort(sort === 'experience' ? (a, b) => b.sessionsCompleted - a.sessionsCompleted || Date.parse(a.slot) - Date.parse(b.slot) : (a, b) => Date.parse(a.slot) - Date.parse(b.slot));
+  const count = root.querySelector('#marketplace-count');
+  if (count) count.textContent = `${sessions.length} available session${sessions.length === 1 ? '' : 's'}`;
+  results.setAttribute('aria-busy', 'false');
+  if (!sessions.length) {
+    results.innerHTML = '<section class="marketplace-empty"><span>⌁</span><h2>No sessions match these filters yet.</h2><p>Clear the filters, publish another time, or let Mocksyra find a compatible partner automatically.</p><div><button class="button secondary" id="empty-clear">Clear filters</button><button class="button" id="empty-auto">Match me automatically</button></div></section>';
+    root.querySelector('#empty-clear').onclick = clearMarketplaceFilters;
+    root.querySelector('#empty-auto').onclick = automaticMarketplaceMatch;
+    return;
+  }
+  results.innerHTML = sessions.map(listing => `<article class="session-card" role="listitem" data-listing-id="${escapeHtml(listing.listingId)}">
+    <header class="session-card-person"><span class="listing-avatar">${escapeHtml(listing.name?.[0] || '?')}</span><div><span class="listing-status">● AVAILABLE</span><h2>${escapeHtml(listing.name)}</h2><p>${escapeHtml(listing.experience)} · ${Number(listing.sessionsCompleted) || 0} sessions completed</p></div></header>
+    <div class="session-card-time"><time datetime="${escapeHtml(listing.slot)}">${escapeHtml(formatSlot(listing.slot))}</time><span>45 min</span></div>
+    <h3>${escapeHtml(listing.interviewType)}</h3><p class="session-role">${escapeHtml(modes[listing.practiceMode]?.title || listing.practiceMode)} · ${escapeHtml(listing.spokenLanguage)}</p>
+    <div class="session-tags" aria-label="Technologies">${listing.languages.map(value => `<span>${escapeHtml(value)}</span>`).join('')}</div>
+    <dl class="session-card-meta"><div><dt>Time zone</dt><dd>${escapeHtml(listing.timezone || 'Not provided')}</dd></div><div><dt>Format</dt><dd>Live video + workspace</dd></div></dl>
+    <div class="session-card-actions"><button class="button full" data-book-listing="${escapeHtml(listing.listingId)}" data-slot="${escapeHtml(listing.slot)}" aria-label="Book ${escapeHtml(listing.name)} for ${escapeHtml(formatSlot(listing.slot))}">Book this session ${icon('arrow')}</button></div><p class="session-card-error" role="alert"></p>
+  </article>`).join('');
+  root.querySelectorAll('[data-book-listing]').forEach(button => button.onclick = () => bookMarketplaceSession(button));
+}
+
+function clearMarketplaceFilters() {
+  ['#filter-technology', '#filter-type', '#filter-language', '#filter-date'].forEach(selector => { const field = root.querySelector(selector); if (field) field.value = ''; });
+  renderMarketplaceResults();
+}
+
+async function automaticMarketplaceMatch() {
+  const button = root.querySelector('#marketplace-auto') || root.querySelector('#empty-auto');
+  if (button) { button.disabled = true; button.textContent = 'Looking for the best match…'; }
+  const response = await request('find-match', {});
+  if (!response.ok) { if (button) { button.disabled = false; button.textContent = 'Match me automatically'; } return toast(response.error); }
+  if (response.activeMatch) { state.match = response.activeMatch; state.roomId = response.activeMatch.roomId; return go('match'); }
+  toast('No exact match yet. Your availability stays published.');
+  if (button) { button.disabled = false; button.textContent = 'Match me automatically'; }
+}
+
+async function bookMarketplaceSession(button) {
+  const card = button.closest('.session-card'), error = card.querySelector('.session-card-error');
+  button.disabled = true; button.setAttribute('aria-busy', 'true'); button.textContent = 'Reserving…'; error.textContent = '';
+  const response = await request('book-listing', { listingId: button.dataset.bookListing, slot: button.dataset.slot });
+  if (!response.ok) {
+    error.textContent = response.error; button.disabled = false; button.removeAttribute('aria-busy'); button.textContent = 'Book this session';
+    await refreshMarketplace(false); return;
+  }
+  state.match = response.activeMatch; state.roomId = response.activeMatch.roomId;
+  localStorage.setItem('mocksyra-active-match', JSON.stringify(response.activeMatch));
+  go('match');
+}
+
+function marketplace() {
+  if (!state.profile) return go('onboarding');
+  if (!closedMatch(state.match)) return go('match');
+  const heading = marketplaceTitle(normalizedMode(state.profile.practiceMode));
+  root.innerHTML = frame(`${stepper(1)}<section class="marketplace-page" aria-labelledby="marketplace-title">
+    <header class="marketplace-heading"><div><p class="eyebrow">SESSION MARKETPLACE</p><h1 class="page-title" id="marketplace-title" tabindex="-1">${heading.title}</h1><p class="page-subtitle">${heading.context}. All times are shown in your timezone.</p></div><button class="button secondary" data-route="onboarding">Change role or availability</button></header>
+    <section class="published-banner"><div><span>● YOUR LISTING IS LIVE</span><b>${escapeHtml(modes[normalizedMode(state.profile.practiceMode)].title)} · ${state.profile.slots?.length || 0} time${state.profile.slots?.length === 1 ? '' : 's'} offered</b></div><button class="text-button" id="cancel-listing">Unpublish</button></section>
+    <form class="marketplace-filters" id="marketplace-filters" aria-label="Filter available sessions"><label>Technology<select class="select" id="filter-technology"><option value="">All technologies</option>${skills.map(value => `<option>${escapeHtml(value)}</option>`).join('')}</select></label><label>Interview focus<select class="select" id="filter-type"><option value="">All interview types</option>${interviewTypes.map(value => `<option>${escapeHtml(value)}</option>`).join('')}</select></label><label>Language<select class="select" id="filter-language"><option value="">All languages</option>${spokenLanguages.map(value => `<option>${escapeHtml(value)}</option>`).join('')}</select></label><label>Date<input class="select" id="filter-date" type="date"></label><button type="button" class="text-button" id="clear-filters">Clear filters</button></form>
+    <div class="marketplace-toolbar"><p id="marketplace-count" role="status" aria-live="polite">Loading sessions…</p><div><button class="text-button" id="refresh-marketplace">Refresh</button><select class="select compact" id="marketplace-sort" aria-label="Sort sessions"><option value="soonest">Soonest first</option><option value="experience">Most experienced</option></select></div></div>
+    <div id="marketplace-results" class="session-list" role="list" aria-busy="true"><p class="empty-state">Loading available sessions…</p></div>
+    <section class="automatic-match-card"><div><span class="eyebrow">WANT THE CLOSEST FIT?</span><h2>Let Mocksyra choose for you.</h2><p>Automatic matching checks role, focus, technology, language, and shared time.</p></div><button class="button button-light" id="marketplace-auto">Match me automatically</button></section>
+  </section>`);
+  bindRoutes();
+  root.querySelector('#marketplace-title').focus({ preventScroll: true });
+  root.querySelectorAll('#marketplace-filters select,#marketplace-filters input,#marketplace-sort').forEach(field => field.onchange = renderMarketplaceResults);
+  root.querySelector('#clear-filters').onclick = clearMarketplaceFilters;
+  root.querySelector('#refresh-marketplace').onclick = () => refreshMarketplace();
+  root.querySelector('#marketplace-auto').onclick = automaticMarketplaceMatch;
+  root.querySelector('#cancel-listing').onclick = async () => { const response = await request('cancel-search'); if (!response.ok) return toast(response.error); state.profile.status = 'idle'; toast('Your availability has been unpublished.'); go('onboarding'); };
+  refreshMarketplace();
 }
 
 function search() {
@@ -305,19 +425,30 @@ async function deviceCheck() {
   status.className = 'device-status ready';
 }
 
+function scheduledJoinState(matchData) {
+  if (!matchData?.opensAt) return { allowed: true, message: 'Room available' };
+  const serverOffset = Number.isFinite(Date.parse(matchData.serverNow)) ? Date.parse(matchData.serverNow) - Date.now() : 0;
+  const now = Date.now() + serverOffset, opens = Date.parse(matchData.opensAt), closes = Date.parse(matchData.closesAt);
+  if (now < opens) return { allowed: false, message: `Room opens ${formatSlot(matchData.opensAt)}` };
+  if (Number.isFinite(closes) && now > closes && matchData.status !== 'in_progress') return { allowed: false, message: 'This session’s join window has closed' };
+  return { allowed: true, message: 'Your room is open' };
+}
+
 function match() {
   if (!state.match || !state.profile) return go('onboarding');
   const peer = state.match.peer;
   const reasons = state.match.reasons || [];
   const feedbackPending = state.match.status === 'feedback_pending';
+  const selectedSession = state.match.source === 'marketplace' || state.match.bookingType === 'marketplace';
+  const joinState = scheduledJoinState(state.match);
   root.innerHTML = frame(`<div class="progress"><i class="done"></i><i class="done"></i><i></i><i></i></div>
-    <h1 class="page-title">Your practice match is ready.</h1><p class="page-subtitle">${modeFor().title} · ${sessionMinutes()} minutes · ${isPeerSession() ? "You’ll switch roles halfway through." : `You will stay in the ${escapeHtml(state.match.practiceMode)} role.`}</p>
-    <div class="match-layout"><section class="match-card"><span class="match-badge">✦ ${state.match.score}% COMPATIBLE</span>
+    <h1 class="page-title">${selectedSession ? 'Your session is booked.' : 'Your practice match is ready.'}</h1><p class="page-subtitle">${modeFor().title} · ${sessionMinutes()} minutes · ${isPeerSession() ? "You’ll switch roles halfway through." : `You will stay in the ${escapeHtml(state.match.practiceMode)} role.`}</p>
+    <div class="match-layout"><section class="match-card"><span class="match-badge">${selectedSession ? '✓ SESSION RESERVED' : `✦ ${state.match.score}% COMPATIBLE`}</span>
       <div class="large-match"><div><div class="portrait coral">${escapeHtml(state.profile.name[0])}</div><small>You</small></div><div class="link">⌁</div><div><div class="portrait lime">${escapeHtml(peer.name[0])}</div><small>${escapeHtml(peer.name.split(' ')[0])}</small></div></div>
       <div class="mode-pill">${icon(modeFor().icon)} ${modeFor().title} · ${sessionMinutes()} min</div><h2>Meet ${escapeHtml(peer.name)}</h2>
       <p class="page-subtitle">${escapeHtml(state.match.interviewType)} · ${escapeHtml(peer.experience)} · ${escapeHtml(formatSlot(state.match.sharedSlot))}</p>
       <div class="reason-list">${reasons.map(reason => `<span>✓ ${escapeHtml(reason)}</span>`).join('')}</div>
-      <div class="button-row"><button class="button secondary" id="calendar">Add to calendar</button><button class="button" id="join">${feedbackPending ? 'Continue to feedback' : 'Join interview room'} <b>→</b></button></div>
+      <p class="join-status" id="join-status">${feedbackPending ? 'Your feedback is ready to complete.' : escapeHtml(joinState.message)}</p><div class="button-row"><button class="button secondary" id="calendar">Add to calendar</button><button class="button" id="join" ${!feedbackPending && !joinState.allowed ? 'disabled' : ''}>${feedbackPending ? 'Continue to feedback' : joinState.allowed ? 'Join interview room' : 'Room not open yet'} <b>→</b></button></div>
     </section><aside class="side-card device-card"><h3>Before you begin</h3><p>Test your devices here. If another browser is using your camera, Mocksyra automatically tries audio-only mode.</p>
       <video id="device-preview" autoplay muted playsinline hidden></video><p class="device-status" id="device-status">Devices not tested</p>
       <button class="button button-light full" id="test-devices">Test camera & mic</button><div class="peer-stat"><b>${Number(peer.sessionsCompleted || 0)}</b><span>completed peer sessions</span></div>
@@ -333,8 +464,18 @@ function match() {
   });
   root.querySelector('#join').onclick = async () => {
     if (feedbackPending) return go('feedback');
-    if (await connectSocket() && await ensureMedia()) go('session');
+    if (!(await connectSocket())) return;
+    if (state.match.videoProvider === 'daily') { endLocalCall(); return go('session'); }
+    const prepared = await request('prepare-call', { roomId: state.roomId });
+    if (!prepared.ok) return toast(prepared.error);
+    if (await ensureMedia()) go('session');
   };
+  clearInterval(state.joinClock);
+  if (!feedbackPending) state.joinClock = setInterval(() => {
+    const next = scheduledJoinState(state.match), button = root.querySelector('#join'), status = root.querySelector('#join-status');
+    if (!button || !status) return clearInterval(state.joinClock);
+    button.disabled = !next.allowed; button.innerHTML = `${next.allowed ? 'Join interview room' : 'Room not open yet'} <b>→</b>`; status.textContent = next.message;
+  }, 30_000);
 }
 
 function calendarDate(value) { return new Date(value).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, ''); }
@@ -350,23 +491,25 @@ function downloadCalendar() {
 }
 
 function session() {
-  if (!state.match || !state.stream?.active) return go('match');
+  const dailySession = state.match?.videoProvider === 'daily';
+  if (!state.match || (!dailySession && !state.stream?.active)) return go('match');
   const peer = state.match.peer, question = state.match.question || {}, startsAsInterviewer = state.match.startsAsInterviewer;
   const peerSession = isPeerSession(), minutes = sessionMinutes(), initialTimer = `${minutes}:00`;
-  const sessionIntro = peerSession ? 'The 90-minute agenda starts when both participants join.' : `This focused ${minutes}-minute session starts when both participants join.`;
+  const sessionIntro = peerSession ? 'This 45-minute session switches roles automatically halfway through.' : `This focused ${minutes}-minute session starts when both participants join.`;
   const agenda = peerSession
-    ? `<div class="agenda-item active" id="agenda-one"><b>Part 1 · ${startsAsInterviewer ? escapeHtml(peer.name.split(' ')[0]) : 'You'} ${startsAsInterviewer ? 'is' : 'are'} candidate</b><small>First 45 minutes.</small></div><div class="agenda-item" id="agenda-two"><b>Part 2 · ${startsAsInterviewer ? 'You are' : `${escapeHtml(peer.name.split(' ')[0])} is`} candidate</b><small>Roles switch automatically.</small></div>`
+    ? `<div class="agenda-item active" id="agenda-one"><b>Part 1 · ${startsAsInterviewer ? escapeHtml(peer.name.split(' ')[0]) : 'You'} ${startsAsInterviewer ? 'is' : 'are'} candidate</b><small>First half of the session.</small></div><div class="agenda-item" id="agenda-two"><b>Part 2 · ${startsAsInterviewer ? 'You are' : `${escapeHtml(peer.name.split(' ')[0])} is`} candidate</b><small>Roles switch automatically.</small></div>`
     : `<div class="agenda-item active" id="agenda-one"><b>${startsAsInterviewer ? 'You are leading the interview' : `You are the candidate`}</b><small>Your role stays the same for this session.</small></div>`;
+  const videoSurface = dailySession ? `<div class="call-stage daily-call-stage tool-panel" id="video-panel"><div class="call-top"><span class="live">● HOSTED VIDEO</span><span id="timer">${initialTimer}</span></div><p class="daily-status" id="daily-status">Preparing your private video room…</p><div class="daily-container" id="daily-container"></div><div class="daily-finish"><button class="call-action end" id="complete"><b>×</b><span>Finish interview</span></button></div></div>` : `<div class="call-stage tool-panel" id="video-panel"><div class="call-top"><span class="live">● LIVE SESSION</span><span id="timer">${initialTimer}</span></div>
+        <div class="connection-banner" id="connection"><i></i><span>Waiting for ${escapeHtml(peer.name)} to join the room…</span></div>
+        <div class="call-users"><div class="video"><video id="local" autoplay muted playsinline></video><small>You</small></div><div class="video"><video id="remote" autoplay playsinline></video><small id="peer-status">${escapeHtml(peer.name)} · not connected</small></div></div>
+        <div class="call-controls"><button class="call-action" id="mic" title="Toggle microphone"><b>●</b><span>Microphone</span></button><button class="call-action" id="cam" title="Toggle camera"><b>◉</b><span>Camera</span></button><button class="call-action end" id="complete" title="Finish interview"><b>×</b><span>Finish</span></button></div></div>`;
   root.innerHTML = frame(`<div class="progress"><i class="done"></i><i class="done"></i><i class="done"></i><i></i></div>
     <div class="session-heading"><div><h1 class="page-title">Interview room</h1><p class="page-subtitle">${sessionIntro}</p></div><div class="room-code">ROOM ${escapeHtml(state.roomId.slice(-6).toUpperCase())}</div></div>
     <div class="session-tools"><button class="tool-tab selected" data-tab="video-panel">Video</button><button class="tool-tab" data-tab="workspace-panel">Shared workspace</button><button class="tool-tab" data-tab="chat-panel">Chat</button></div>
     <div class="session"><section class="session-main">
-      <div class="call-stage tool-panel" id="video-panel"><div class="call-top"><span class="live">● LIVE SESSION</span><span id="timer">${initialTimer}</span></div>
-        <div class="connection-banner" id="connection"><i></i><span>Waiting for ${escapeHtml(peer.name)} to join the room…</span></div>
-        <div class="call-users"><div class="video"><video id="local" autoplay muted playsinline></video><small>You</small></div><div class="video"><video id="remote" autoplay playsinline></video><small id="peer-status">${escapeHtml(peer.name)} · not connected</small></div></div>
-        <div class="call-controls"><button class="call-action" id="mic" title="Toggle microphone"><b>●</b><span>Microphone</span></button><button class="call-action" id="cam" title="Toggle camera"><b>◉</b><span>Camera</span></button><button class="call-action end" id="complete" title="Finish interview"><b>×</b><span>Finish</span></button></div></div>
-      <div class="workspace-card tool-panel" id="workspace-panel" hidden><div class="workspace-head"><div><span class="eyebrow">LIVE SHARED PAD</span><h2>${escapeHtml(question.title || 'Collaborative workspace')}</h2></div><select id="code-language" class="select compact">${['JavaScript', 'TypeScript', 'Python', 'Java', 'C++', 'SQL', 'Plain text'].map(value => `<option ${value === state.workspace.language ? 'selected' : ''}>${value}</option>`).join('')}</select></div>
-        <div class="question-box"><b>Your interviewer brief</b><p>${escapeHtml(question.prompt || 'Use the shared pad to work through your interview question.')}</p>${question.hints?.length ? `<details><summary>Hints for the interviewer</summary><ul>${question.hints.map(hint => `<li>${escapeHtml(hint)}</li>`).join('')}</ul></details>` : ''}</div>
+      ${videoSurface}
+      <div class="workspace-card tool-panel" id="workspace-panel" hidden><div class="workspace-head"><div><span class="eyebrow">LIVE SHARED PAD</span><h2 id="question-title">${escapeHtml(question.title || 'Collaborative workspace')}</h2></div><select id="code-language" class="select compact">${['JavaScript', 'TypeScript', 'Python', 'Java', 'C++', 'SQL', 'Plain text'].map(value => `<option ${value === state.workspace.language ? 'selected' : ''}>${value}</option>`).join('')}</select></div>
+        <div class="question-box" id="question-brief"><b>Interview question</b><p>${escapeHtml(question.prompt || 'Use the shared pad to work through your interview question.')}</p>${question.hints?.length ? `<details><summary>Hints for the interviewer</summary><ul>${question.hints.map(hint => `<li>${escapeHtml(hint)}</li>`).join('')}</ul></details>` : ''}</div>
         <textarea id="shared-code" class="code-editor" spellcheck="false">${escapeHtml(state.workspace.code || question.starter || '')}</textarea>
         <div class="workspace-actions"><span id="sync-status">Synced with your peer</span><button class="button secondary" id="copy-code">Copy</button><button class="button" id="run-code">Run JavaScript</button></div><pre id="code-output" class="code-output">Output will appear here.</pre></div>
       <div class="workspace-card tool-panel" id="chat-panel" hidden><div class="workspace-head"><div><span class="eyebrow">ROOM CHAT</span><h2>Messages with ${escapeHtml(peer.name)}</h2></div></div><div class="chat-messages" id="chat-messages"></div><div class="chat-compose"><input id="chat-input" class="textarea input" maxlength="500" placeholder="Send a useful link or short message"><button class="button" id="send-chat">Send</button></div></div>
@@ -375,13 +518,49 @@ function session() {
       <div class="agenda-item" id="agenda-feedback"><b>Peer feedback</b><small>Unlocked after the call.</small></div>
       <label class="field-label">PRIVATE NOTES</label><textarea id="private-notes" class="textarea" placeholder="Only you can see these notes."></textarea></aside></div>`);
   bindRoutes();
-  root.querySelector('#local').srcObject = state.stream;
+  if (!dailySession) root.querySelector('#local').srcObject = state.stream;
   root.querySelector('#private-notes').value = localStorage.getItem(`mocksyra-notes-${state.roomId}`) || '';
   root.querySelector('#private-notes').oninput = event => localStorage.setItem(`mocksyra-notes-${state.roomId}`, event.target.value);
-  bindSessionTabs(); bindWorkspace(); bindChat(); renderChat(); prepareCall();
-  root.querySelector('#mic').onclick = event => toggleTrack('audio', event.currentTarget);
-  root.querySelector('#cam').onclick = event => toggleTrack('video', event.currentTarget);
+  bindSessionTabs(); bindWorkspace(); bindChat(); renderChat();
+  if (dailySession) prepareDailyCall(); else {
+    prepareCall();
+    root.querySelector('#mic').onclick = event => toggleTrack('audio', event.currentTarget);
+    root.querySelector('#cam').onclick = event => toggleTrack('video', event.currentTarget);
+  }
   root.querySelector('#complete').onclick = () => { if (confirm('Finish the interview for both participants and open feedback?')) socket.emit('complete-session', state.roomId); };
+}
+
+async function prepareDailyCall() {
+  const status = root.querySelector('#daily-status'), container = root.querySelector('#daily-container');
+  if (!window.DailyIframe) { status.textContent = 'The hosted video component could not load. Check your connection and refresh.'; status.classList.add('error'); return; }
+  const access = await request('prepare-call', { roomId: state.roomId }, 30_000);
+  if (!access.ok) { status.textContent = access.error; status.classList.add('error'); return; }
+  if (access.provider !== 'daily') {
+    state.match.videoProvider = 'webrtc';
+    status.textContent = 'Using the browser video fallback…';
+    if (await ensureMedia()) session();
+    return;
+  }
+  const call = window.DailyIframe.createFrame(container, {
+    showLeaveButton: true,
+    iframeStyle: { width: '100%', height: '100%', border: '0', borderRadius: '8px' }
+  });
+  state.dailyCall = call;
+  call.on('joined-meeting', async () => {
+    status.textContent = 'Secure video connected.'; status.classList.add('ready');
+    const joined = await request('join-session', state.roomId);
+    if (!joined.ok) { status.textContent = joined.error; status.classList.add('error'); return; }
+    if (joined.startedAt) startSyncedTimer(joined.startedAt);
+    socket.emit('workspace-request', state.roomId);
+  });
+  call.on('left-meeting', () => { socket.emit('leave-session', state.roomId); if (state.dailyCall === call) state.dailyCall = null; try { call.destroy(); } catch {} if (location.hash === '#session') go('match'); });
+  call.on('error', event => { status.textContent = event?.errorMsg || 'Video connection interrupted. Please retry.'; status.classList.add('error'); });
+  try {
+    await call.join({ url: access.roomUrl, token: access.token });
+    access.token = '';
+  } catch {
+    status.textContent = 'Could not enter the hosted video room. Please refresh and retry.'; status.classList.add('error');
+  }
 }
 
 function bindSessionTabs() {
@@ -429,12 +608,12 @@ function updateConnection(text, ready) {
 function startSyncedTimer(startedAt) {
   clearInterval(state.clock); state.sessionStartedAt = new Date(startedAt).getTime();
   const update = () => {
-    const elapsed = Math.max(0, Math.floor((Date.now() - state.sessionStartedAt) / 1000)), totalSeconds = sessionMinutes() * 60, remaining = Math.max(0, totalSeconds - elapsed);
+    const elapsed = Math.max(0, Math.floor((Date.now() - state.sessionStartedAt) / 1000)), totalSeconds = sessionMinutes() * 60, switchAt = Math.floor(totalSeconds / 2), remaining = Math.max(0, totalSeconds - elapsed);
     const value = `${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, '0')}`;
     const timer = root.querySelector('#timer'), side = root.querySelector('#side-timer'); if (timer) timer.textContent = value; if (side) side.textContent = value;
-    const secondHalf = isPeerSession() && elapsed >= 2700;
+    const secondHalf = isPeerSession() && elapsed >= switchAt;
     root.querySelector('#agenda-one')?.classList.toggle('active', !secondHalf); root.querySelector('#agenda-two')?.classList.toggle('active', secondHalf);
-    if (isPeerSession() && elapsed === 2700) toast('45 minutes complete — switch interviewer and candidate roles.', 5000);
+    if (isPeerSession() && elapsed === switchAt) toast('Halfway point — interviewer and candidate roles have switched.', 5000);
     if (!remaining) socket.emit('complete-session', state.roomId);
   };
   update(); state.clock = setInterval(update, 1000);
@@ -469,11 +648,19 @@ function renderChat() {
   container.scrollTop = container.scrollHeight;
 }
 
-function endLocalCall() { clearInterval(state.clock); state.stream?.getTracks().forEach(track => track.stop()); state.pc?.close(); state.stream = null; state.pc = null; }
+function endLocalCall() {
+  clearInterval(state.clock); clearInterval(state.joinClock);
+  state.stream?.getTracks().forEach(track => track.stop()); state.pc?.close(); state.stream = null; state.pc = null;
+  const daily = state.dailyCall; state.dailyCall = null;
+  if (daily) { Promise.resolve(daily.leave()).catch(() => {}).finally(() => { try { daily.destroy(); } catch {} }); }
+}
 
 function feedback() {
   if (!state.match) return go('activity');
-  const peer = state.match.peer, criteria = ['Problem solving', 'Communication', 'Technical depth'];
+  const peer = state.match.peer;
+  const criteria = Array.isArray(state.match.feedbackCriteria) && state.match.feedbackCriteria.length === 3
+    ? state.match.feedbackCriteria
+    : ['Problem solving', 'Communication', 'Technical depth'];
   root.innerHTML = frame(`<div class="progress"><i class="done"></i><i class="done"></i><i class="done"></i><i class="done"></i></div>
     <h1 class="page-title">Share thoughtful feedback.</h1><p class="page-subtitle">Your peer sees it only after both of you submit.</p>
     <div class="feedback-grid"><section class="panel"><h2>Rate ${escapeHtml(peer.name.split(' ')[0])}'s interview</h2>
@@ -490,7 +677,7 @@ function feedback() {
   root.querySelectorAll('[data-repeat]').forEach(button => button.onclick = () => { practiseAgain = button.dataset.repeat === 'yes'; root.querySelectorAll('[data-repeat]').forEach(item => item.classList.toggle('selected', item === button)); });
   root.querySelector('#submit').onclick = () => {
     const strength = root.querySelector('#strength').value.trim(), improve = root.querySelector('#improve').value.trim();
-    if (scores.some(score => !score)) return toast('Please rate all three areas.');
+    if (scores.some(score => !score)) return toast(`Please rate all ${criteria.length} areas.`);
     if (strength.length < 5 || improve.length < 5) return toast('Add a short strength and an actionable improvement.');
     const button = root.querySelector('#submit'); button.disabled = true; button.textContent = 'Waiting for peer…';
     socket.emit('submit-feedback', { roomId: state.roomId, feedback: { scores, strength, improve, practiseAgain } });
@@ -512,7 +699,7 @@ function activity() {
   const completed = state.history.length, averages = state.history.flatMap(item => item.feedbackReceived?.scores || []);
   const average = averages.length ? (averages.reduce((sum, score) => sum + score, 0) / averages.length).toFixed(1) : '—';
   root.innerHTML = frame(`<button class="back" data-route="onboarding">← BACK TO MATCHING</button><h1 class="page-title">Your Mocksyra activity</h1><p class="page-subtitle">Matches, reminders, and completed feedback stay together here.</p>
-    <div class="metric-row activity-metrics"><div class="metric"><b>${completed}</b><small>SESSIONS</small></div><div class="metric"><b>${average}${average === '—' ? '' : '/5'}</b><small>AVERAGE RATING</small></div><div class="metric"><b>${state.history.reduce((total, item) => total + (Number(item.durationMinutes) || (item.sessionMode === 'directed' ? 45 : 90)), 0)}</b><small>PLANNED MINUTES</small></div></div>
+    <div class="metric-row activity-metrics"><div class="metric"><b>${completed}</b><small>SESSIONS</small></div><div class="metric"><b>${average}${average === '—' ? '' : '/5'}</b><small>AVERAGE RATING</small></div><div class="metric"><b>${state.history.reduce((total, item) => total + (Number(item.durationMinutes) || 45), 0)}</b><small>PLANNED MINUTES</small></div></div>
     <div class="activity-grid"><section class="panel"><div class="panel-heading"><h2>Session history</h2>${state.match ? '<button class="button secondary" data-route="match">Open active match</button>' : ''}</div>
       <div class="history-list">${state.history.length ? state.history.map((item, index) => `<article class="history-card"><div><span class="match-badge">${escapeHtml(item.interviewType)}</span><h3>${escapeHtml(item.peer.name)}</h3><p>${escapeHtml(formatSlot(item.sharedSlot))} · ${escapeHtml(item.peer.experience)}</p></div><div><b>${item.feedbackReceived ? `${(item.feedbackReceived.scores.reduce((a, b) => a + b, 0) / 3).toFixed(1)}/5` : 'Pending'}</b><button class="text-button" data-summary="${index}">Download summary</button></div></article>`).join('') : '<p class="empty-state">Complete your first interview to build a feedback history.</p>'}</div>
     </section><aside class="panel"><div class="panel-heading"><h2>Notifications</h2><button class="text-button" id="enable-alerts">Enable browser alerts</button></div>
@@ -527,7 +714,7 @@ function activity() {
 
 function downloadSummary(item) {
   const feedbackData = item.feedbackReceived;
-  const text = ['MOCKSYRA SESSION SUMMARY', `Peer: ${item.peer.name}`, `Type: ${item.interviewType}`, `Time: ${formatSlot(item.sharedSlot)}`, '', 'WHAT WENT WELL', feedbackData?.strength || 'Feedback pending', '', 'FOCUS FOR NEXT TIME', feedbackData?.improve || 'Feedback pending'].join('\n');
+  const text = ['MOCKSYRA SESSION SUMMARY', `Peer: ${item.peer.name}`, `Mode: ${modes[normalizedMode(item.practiceMode)]?.title || item.practiceMode || 'Peer Practice'}`, `Type: ${item.interviewType}`, `Time: ${formatSlot(item.sharedSlot)}`, '', 'WHAT WENT WELL', feedbackData?.strength || 'Feedback pending', '', 'FOCUS FOR NEXT TIME', feedbackData?.improve || 'Feedback pending'].join('\n');
   const link = document.createElement('a'); link.href = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
   link.download = `mocksyra-${new Date(item.completedAt || Date.now()).toISOString().slice(0, 10)}.txt`; link.click(); URL.revokeObjectURL(link.href);
 }
@@ -537,20 +724,47 @@ function showSystemNotification(item) {
   if ('Notification' in window && Notification.permission === 'granted' && document.hidden) new Notification(item.title, { body: item.body });
 }
 
+function clearActiveMatch() {
+  endLocalCall();
+  state.match = null; state.roomId = null; state.feedback = null;
+  localStorage.removeItem('mocksyra-active-match');
+}
+
 socket.on('connect', () => socket.emit('restore-profile'));
 socket.on('match-waiting', () => toast('You are in the queue. We will notify you when a compatible peer is found.'));
 socket.on('match-found', matchData => {
   state.match = matchData; state.roomId = matchData.roomId; localStorage.setItem('mocksyra-active-match', JSON.stringify(matchData));
-  if (location.hash === '#search' || location.hash === '#onboarding') go('match'); else showSystemNotification({ title: 'Your Mocksyra match is ready', body: `You matched with ${matchData.peer.name}.` });
+  if (['#search', '#marketplace', '#onboarding'].includes(location.hash)) go('match'); else showSystemNotification({ title: 'Your Mocksyra match is ready', body: `You matched with ${matchData.peer.name}.` });
 });
+socket.on('profile-state', restored => {
+  if (restored?.profile) { state.profile = { ...state.profile, ...restored.profile }; localStorage.setItem(PROFILE_KEY, JSON.stringify(state.profile)); }
+  if (restored?.activeMatch) { state.match = restored.activeMatch; state.roomId = restored.activeMatch.roomId; localStorage.setItem('mocksyra-active-match', JSON.stringify(restored.activeMatch)); }
+  else if (restored && Object.hasOwn(restored, 'activeMatch') && state.match && location.hash !== '#feedback') clearActiveMatch();
+  if (Array.isArray(restored?.history)) state.history = restored.history;
+  if (Array.isArray(restored?.notifications)) state.notifications = restored.notifications;
+});
+socket.on('session-listings', listings => { state.listings = listings || []; if (location.hash === '#marketplace') renderMarketplaceResults(); });
+socket.on('listings-updated', () => { if (location.hash === '#marketplace') refreshMarketplace(false); });
 socket.on('notifications', notifications => { state.notifications = notifications || []; if (location.hash === '#activity') activity(); });
 socket.on('notification', notification => { state.notifications = [notification, ...state.notifications.filter(item => item.id !== notification.id)]; showSystemNotification(notification); if (location.hash === '#activity') activity(); });
 socket.on('history', history => { state.history = history || []; if (location.hash === '#activity') activity(); });
 socket.on('peer-entered-room', () => { toast('Your peer entered the room.'); const button = root.querySelector('#join'); if (button) { button.innerHTML = 'Peer is ready — join now <b>→</b>'; button.classList.add('button-light'); } });
 socket.on('session-ready', async packet => {
-  if (!state.pc) return; startSyncedTimer(packet.startedAt);
+  if (packet.startedAt) startSyncedTimer(packet.startedAt);
+  if (state.match?.videoProvider === 'daily') { const status = root.querySelector('#daily-status'); if (status) { status.textContent = 'Both participants are here. Your session has started.'; status.classList.add('ready'); } return; }
+  if (!state.pc) return;
   if (state.match?.startsAsInterviewer && !state.offerStarted) { state.offerStarted = true; const offer = await state.pc.createOffer(); await state.pc.setLocalDescription(offer); socket.emit('signal', { roomId: state.roomId, data: { offer } }); }
   updateConnection('Peer joined — establishing secure connection…', false);
+});
+socket.on('session-phase', packet => {
+  state.match = { ...state.match, ...packet, question: packet.question || state.match?.question };
+  localStorage.setItem('mocksyra-active-match', JSON.stringify(state.match));
+  root.querySelector('#agenda-one')?.classList.toggle('active', packet.phase !== 2);
+  root.querySelector('#agenda-two')?.classList.toggle('active', packet.phase === 2);
+  const question = packet.question || {}, title = root.querySelector('#question-title'), brief = root.querySelector('#question-brief');
+  if (title) title.textContent = question.title || 'Collaborative workspace';
+  if (brief) brief.innerHTML = `<b>Interview question</b><p>${escapeHtml(question.prompt || 'Use the shared pad to work through your interview question.')}</p>${question.hints?.length ? `<details><summary>Hints for the interviewer</summary><ul>${question.hints.map(hint => `<li>${escapeHtml(hint)}</li>`).join('')}</ul></details>` : ''}`;
+  toast(`Roles switched — you are now the ${packet.role}.`, 5000);
 });
 socket.on('signal', handleSignal);
 socket.on('workspace-state', workspace => {
@@ -587,14 +801,15 @@ document.addEventListener('click', event => { if (event.target.closest('#logout'
 function router() {
   const route = location.hash.slice(1) || 'home';
   if (route === 'auth') return window.renderAuthPage();
-  const protectedRoutes = ['onboarding', 'search', 'match', 'session', 'feedback', 'dashboard', 'activity'];
+  const protectedRoutes = ['onboarding', 'marketplace', 'search', 'match', 'session', 'feedback', 'dashboard', 'activity'];
   if (protectedRoutes.includes(route) && !localStorage.getItem(EMAIL_KEY)) return window.renderAuthPage();
   const active = readJson('mocksyra-active-match', null);
   if (!state.match && active) { state.match = active; state.roomId = active.roomId; }
-  const routes = { onboarding, search, match, session, feedback, dashboard, activity };
+  const routes = { onboarding, marketplace, search, match, session, feedback, dashboard, activity };
   (routes[route] || home)();
   if (localStorage.getItem(EMAIL_KEY)) connectSocket();
 }
+window.navigateMocksyra = route => { if (location.hash === `#${route}`) router(); else go(route); };
 
 window.addEventListener('hashchange', router);
 async function restoreAuthentication() {

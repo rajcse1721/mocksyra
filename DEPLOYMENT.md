@@ -52,6 +52,12 @@ To enable email, create these secret environment variables manually in Render:
 
 Do not add either value to repository files. Redeploy the Render service after setting them.
 
+## 5. Hosted Daily video
+
+Mocksyra automatically uses Daily Prebuilt for newly booked sessions when `DAILY_API_KEY` is configured. Create an API key in the Daily dashboard, add it to Render as a secret environment variable named `DAILY_API_KEY`, and redeploy the backend. Never add this key to Netlify, `runtime-config.js`, Git, screenshots, or client-side code.
+
+The backend creates private two-person rooms only when an authenticated participant enters the join window. Rooms and participant tokens expire automatically. Existing matches keep the video provider selected when they were created; local development without a Daily key uses the direct WebRTC fallback.
+
 ## Local development
 
 Leave `window.MOCKSYRA_SOCKET_URL` empty, run `npm start`, then open `http://localhost:3000`. The backend uses `data/mocksyra.json` locally when no server secret key is configured.

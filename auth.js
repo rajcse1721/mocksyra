@@ -23,7 +23,7 @@ window.renderAuthPage = function () {
     if (result.data.session) {
       localStorage.setItem('mocksyra-email', email);
       window.connectMocksyraSocket?.();
-      setTimeout(() => location.hash = 'onboarding', 400);
+      setTimeout(() => window.navigateMocksyra?.('onboarding'), 400);
     }
   };
 };

@@ -53,6 +53,25 @@ function fakeSocketSDK() {
       receive(event, payload) { return Promise.all((listeners.get(event) || []).slice().map(fn => fn(payload))); },
       emit(event, payload, ack) {
         socket.sent.push({ event, payload });
+        if (event === 'publish-listing') {
+          socket.profile = { ...payload, status: 'waiting', listingId: 'self-listing' };
+          if (typeof ack === 'function') ack({ ok: true, profile: socket.profile, listings: [], serverNow: new Date().toISOString() });
+          return socket;
+        }
+        if (event === 'browse-listings') {
+          const ownMode = socket.profile?.practiceMode || 'candidate';
+          const otherMode = ownMode === 'candidate' ? 'interviewer' : ownMode === 'interviewer' ? 'candidate' : 'peer';
+          const listing = { listingId: `fixture-${otherMode}-listing`, name: 'Maya Sharma', experience: 'Intermediate', languages: ['Python', 'AWS'], sessionsCompleted: 4, practiceMode: otherMode, interviewType: 'System Design', spokenLanguage: 'English', timezone: 'Asia/Kolkata', slots: [new Date(Date.now() + 5 * 60 * 1000).toISOString()] };
+          if (typeof ack === 'function') ack({ ok: true, listings: [listing], serverNow: new Date().toISOString() });
+          return socket;
+        }
+        if (event === 'book-listing') {
+          const practiceMode = socket.profile?.practiceMode || 'candidate', directed = practiceMode !== 'peer';
+          const now = Date.now(), activeMatch = { roomId: `fixture-${practiceMode}-123456`, peer: { name: 'Maya Sharma', experience: 'Intermediate', languages: ['Python', 'AWS'], sessionsCompleted: 4 }, practiceMode, sessionMode: directed ? 'directed' : 'peer', peerRole: practiceMode === 'candidate' ? 'interviewer' : practiceMode === 'interviewer' ? 'candidate' : 'peer', durationMinutes: 45, startsAsInterviewer: practiceMode === 'interviewer', initiator: false, score: null, source: 'marketplace', bookingType: 'marketplace', reasons: ['Session selected by you'], sharedSlot: new Date(now + 5 * 60 * 1000).toISOString(), opensAt: new Date(now - 5 * 60 * 1000).toISOString(), closesAt: new Date(now + 20 * 60 * 1000).toISOString(), serverNow: new Date(now).toISOString(), canJoinNow: true, videoProvider: window.__fixtureHostedVideo ? 'daily' : 'webrtc', interviewType: 'System Design', question: { title: 'Build a service', prompt: 'Explain and implement a reliable service.', ...(practiceMode === 'interviewer' ? { hints: ['Fixture interviewer-only hint'] } : {}) }, feedbackCriteria: practiceMode === 'candidate' ? ['Question clarity', 'Guidance', 'Professionalism'] : ['Problem solving', 'Communication', 'Technical depth'], feedbackSubmitted: false, selfFeedback: null, status: 'matched' };
+          if (typeof ack === 'function') ack({ ok: true, activeMatch });
+          return socket;
+        }
+        if (event === 'prepare-call') { if (typeof ack === 'function') ack(window.__fixtureHostedVideo ? { ok: true, provider: 'daily', roomUrl: 'https://fixture.daily.test/private-room', token: 'short-lived-fixture-token' } : { ok: true, provider: 'webrtc' }); return socket; }
         if (event === 'workspace-request') queueMicrotask(() => socket.receive('workspace-state', { language: 'JavaScript', code: '// Work together here', version: 0 }));
         if (event === 'workspace-update') queueMicrotask(() => socket.receive('workspace-state', { ...payload, version: 1 }));
         if (event === 'chat-message') queueMicrotask(() => socket.receive('chat-message', { ...payload, id: 'local-message', name: 'Alex Morgan', createdAt: new Date().toISOString() }));
@@ -64,6 +83,19 @@ function fakeSocketSDK() {
     window.__mocksyraSocket = socket;
     return socket;
   };
+}
+
+function fakeDailySDK() {
+  window.DailyIframe = { createFrame(container) {
+    const listeners = new Map();
+    const surface = document.createElement('div'); surface.className = 'daily-fixture-surface'; surface.textContent = 'Hosted video preview'; container.append(surface);
+    return {
+      on(name, callback) { listeners.set(name, callback); return this; },
+      async join(credentials) { window.__dailyJoin = credentials; queueMicrotask(() => listeners.get('joined-meeting')?.()); },
+      async leave() { listeners.get('left-meeting')?.(); },
+      destroy() { surface.remove(); }
+    };
+  } };
 }
 
 function isolateDevices() {
@@ -104,12 +136,12 @@ function fixtureMatch(practiceMode) {
     practiceMode,
     sessionMode: directed ? 'directed' : 'peer',
     peerRole: practiceMode === 'candidate' ? 'interviewer' : practiceMode === 'interviewer' ? 'candidate' : 'peer',
-    durationMinutes: directed ? 45 : 90,
+    durationMinutes: 45,
     startsAsInterviewer: practiceMode === 'interviewer',
     initiator: false,
     score: 100,
     reasons: ['Same interview type', 'Shared JavaScript and React', 'Shared availability'],
-    sharedSlot: new Date(Date.now() + 86400000).toISOString(),
+    sharedSlot: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
     interviewType: 'Frontend',
     question: { title: 'Build a searchable list', prompt: 'Explain and implement filtering a list by a search query.', ...(practiceMode === 'interviewer' ? { hints: ['Fixture interviewer-only hint'] } : {}) },
     feedbackCriteria: practiceMode === 'candidate' ? ['Question clarity', 'Guidance', 'Interview structure'] : ['Problem solving', 'Communication', 'Technical depth'],
@@ -133,17 +165,19 @@ const server = http.createServer((request, response) => {
   });
 });
 
-async function newPage(authenticated = true) {
+async function newPage(authenticated = true, hostedVideo = false) {
   const context = await browser.newContext({ viewport: { width: 1440, height: 1000 }, timezoneId: 'Asia/Kolkata', locale: 'en-IN', reducedMotion: 'reduce' });
   await context.route('**/*', async route => {
     const url = route.request().url();
     if (url.includes('cdn.jsdelivr.net/npm/@supabase/')) return route.fulfill({ contentType: 'text/javascript', body: `(${fakeSupabaseSDK})();` });
     if (url.includes('cdn.socket.io/') || url.endsWith('/socket.io/socket.io.js')) return route.fulfill({ contentType: 'text/javascript', body: `(${fakeSocketSDK})();` });
+    if (url.includes('@daily-co/daily-js')) return route.fulfill({ contentType: 'text/javascript', body: `(${fakeDailySDK})();` });
     if (url.startsWith(origin) || url.startsWith('blob:') || url.startsWith('data:')) return route.continue();
     report.blockedRemoteRequests.push(url);
     return route.abort();
   });
   await context.addInitScript(isolateDevices);
+  await context.addInitScript(value => { window.__fixtureHostedVideo = value; }, hostedVideo);
   await context.addInitScript(loggedIn => { if (loggedIn) localStorage.setItem('mocksyra-email', 'fixture@example.test'); }, authenticated);
   const page = await context.newPage();
   page.on('pageerror', error => report.pageErrors.push(error.message));
@@ -197,8 +231,8 @@ async function verifyMode(practiceMode) {
   await page.goto(`${origin}/#onboarding`); await page.locator('#name').waitFor();
   await page.locator(`[data-mode="${practiceMode}"]`).click();
   assert.equal(await page.locator(`[data-mode="${practiceMode}"]`).getAttribute('aria-pressed'), 'true');
-  await page.locator('#find').click();
-  assert.equal(await page.evaluate(() => window.__mocksyraSocket.sent.filter(item => item.event === 'find-match').length), 0, 'Incomplete preferences cannot enter matching');
+  await page.locator('#publish').click();
+  assert.equal(await page.evaluate(() => window.__mocksyraSocket.sent.filter(item => item.event === 'publish-listing').length), 0, 'Incomplete preferences cannot publish');
   await page.locator('#name').fill('Alex Morgan');
   await page.locator('#interview-type').selectOption('Frontend');
   await page.locator('#experience').selectOption('Intermediate');
@@ -211,15 +245,24 @@ async function verifyMode(practiceMode) {
     await checkOverflow(page, 'onboarding mobile'); await screenshot(page, 'onboarding-mobile');
     await page.setViewportSize({ width: 1440, height: 1000 });
   }
-  await page.locator('#find').click();
-  await page.waitForFunction(() => window.__mocksyraSocket.sent.some(item => item.event === 'find-match'));
-  const submitted = await page.evaluate(() => window.__mocksyraSocket.sent.find(item => item.event === 'find-match').payload);
+  await page.locator('#publish').click();
+  await page.waitForFunction(() => window.__mocksyraSocket.sent.some(item => item.event === 'publish-listing'));
+  const submitted = await page.evaluate(() => window.__mocksyraSocket.sent.find(item => item.event === 'publish-listing').payload);
   assert.equal(submitted.practiceMode, practiceMode);
   assert.deepEqual(submitted.languages, ['JavaScript', 'React']);
   assert.equal(submitted.slots.length, 1);
-  await page.waitForURL('**/#search');
-  const match = fixtureMatch(practiceMode);
-  await page.evaluate(packet => window.__mocksyraSocket.receive('match-found', packet), match);
+  await page.waitForURL('**/#marketplace');
+  await page.locator('.session-card').waitFor();
+  assert.match(await page.locator('.session-card').innerText(), /Python|AWS/);
+  assert.equal(await page.locator('.session-card').getByText(/Join room/i).count(), 0, 'public listing never exposes Join');
+  if (practiceMode === 'candidate') {
+    await screenshot(page, 'marketplace-desktop');
+    await page.setViewportSize({ width: 390, height: 844 });
+    await checkOverflow(page, 'marketplace mobile'); await screenshot(page, 'marketplace-mobile');
+    await page.setViewportSize({ width: 1440, height: 1000 });
+  }
+  await page.locator('[data-book-listing]').first().click();
+  const match = fixtureMatch(practiceMode); match.durationMinutes = 45;
   await page.locator('#join').waitFor();
   assert.match(await page.locator('#app').innerText(), new RegExp(`${match.durationMinutes}`));
   const calendarDownload = page.waitForEvent('download');
@@ -270,6 +313,9 @@ async function verifyMode(practiceMode) {
   await page.locator('[data-tab="video-panel"]').click();
   await page.locator('#complete').click();
   await page.locator('#submit').waitFor();
+  const feedbackText = await page.locator('.feedback-grid').innerText();
+  if (practiceMode === 'candidate') assert.match(feedbackText, /Question clarity/i);
+  else assert.match(feedbackText, /Problem solving/i);
   await page.locator('#submit').click();
   assert.equal(await page.evaluate(() => window.__mocksyraSocket.sent.filter(item => item.event === 'submit-feedback').length), 0);
   for (const row of await page.locator('.rating-row').all()) await row.locator('[data-score="4"]').click();
@@ -278,7 +324,31 @@ async function verifyMode(practiceMode) {
   await page.locator('[data-repeat="yes"]').click();
   await page.locator('#submit').click();
   assert.equal(await page.evaluate(() => window.__mocksyraSocket.sent.filter(item => item.event === 'submit-feedback').length), 1);
-  report.checks.push(`${practiceMode}: selected mode reaches match request, ${match.durationMinutes}-minute match/calendar/session, device toggle, shared editor/JavaScript, chat, feedback validation`);
+  report.checks.push(`${practiceMode}: publishes availability, sees complementary marketplace listings across technologies, books a private 45-minute session, then reaches calendar/session, device toggle, shared editor, chat and feedback`);
+  await page.context().close();
+}
+
+async function verifyHostedVideo() {
+  const page = await newPage(true, true);
+  await page.goto(`${origin}/#onboarding`); await page.locator('#name').waitFor();
+  await page.locator('[data-mode="candidate"]').click();
+  await page.locator('#name').fill('Alex Morgan');
+  await page.locator('#interview-type').selectOption('Frontend');
+  await page.locator('#experience').selectOption('Intermediate');
+  await page.locator('#languages [data-value="JavaScript"]').click();
+  await page.locator('#slots button').first().click();
+  await page.locator('#publish').click();
+  await page.locator('.session-card').waitFor();
+  await page.locator('[data-book-listing]').first().click();
+  await page.locator('#join').click();
+  await page.waitForFunction(() => Boolean(window.__dailyJoin));
+  assert.equal(await page.evaluate(() => window.__dailyJoin.url), 'https://fixture.daily.test/private-room');
+  assert.equal(await page.evaluate(() => [...Array(localStorage.length)].map((_, index) => localStorage.getItem(localStorage.key(index))).some(value => value?.includes('short-lived-fixture-token'))), false, 'Daily token is never persisted');
+  assert.equal(await page.locator('#local').count(), 0, 'Daily owns camera and microphone capture');
+  assert.match(await page.locator('#daily-status').innerText(), /connected/i);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await checkOverflow(page, 'hosted video mobile'); await screenshot(page, 'session-daily-mobile');
+  report.checks.push('Daily Prebuilt path requests short-lived credentials, avoids token persistence and fits mobile');
   await page.context().close();
 }
 
@@ -292,7 +362,7 @@ async function verifyHistory() {
   }));
   await page.evaluate(packet => window.__mocksyraSocket.receive('history', packet), history);
   assert.equal(await page.locator('.history-card').count(), 3);
-  assert.match(await page.locator('.activity-metrics').innerText(), /180/);
+  assert.match(await page.locator('.activity-metrics').innerText(), /135/);
   await page.setViewportSize({ width: 390, height: 844 });
   await checkOverflow(page, 'history mobile');
   await screenshot(page, 'history-mobile');
@@ -301,7 +371,7 @@ async function verifyHistory() {
   const summary = fs.readFileSync(await (await download).path(), 'utf8');
   assert.match(summary, /Clear reasoning\./);
   assert.match(summary, /candidate/i);
-  report.checks.push('History totals mixed 45/45/90-minute modes correctly and downloads candidate feedback');
+  report.checks.push('History totals three 45-minute modes correctly and downloads candidate feedback');
   await page.context().close();
 }
 
@@ -311,7 +381,7 @@ async function verifyHistory() {
   origin = `http://127.0.0.1:${server.address().port}`;
   try {
     browser = await playwright.chromium.launch({ channel: process.env.MOCKSYRA_BROWSER_CHANNEL || 'chrome', headless: true });
-    for (const [name, run] of [['guest', verifyGuest], ...['candidate', 'interviewer', 'peer'].map(mode => [mode, () => verifyMode(mode)]), ['history', verifyHistory]]) {
+    for (const [name, run] of [['guest', verifyGuest], ...['candidate', 'interviewer', 'peer'].map(mode => [mode, () => verifyMode(mode)]), ['hosted-video', verifyHostedVideo], ['history', verifyHistory]]) {
       try { await run(); process.stdout.write(`PASS ${name}\n`); }
       catch (error) { report.errors.push(`${name}: ${error.stack}`); process.stderr.write(`FAIL ${name}: ${error.message}\n`); }
     }

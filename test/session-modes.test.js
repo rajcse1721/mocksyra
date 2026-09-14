@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { compatibility, publicMatch, historyFor, app } = require('../server');
-const { compatibleModes, sessionDetails, currentQuestion, canUseRoom, validFeedback, finishFeedback } = require('../session-rules');
+const { PEER_SWITCH_MS, compatibleModes, sessionDetails, currentQuestion, canUseRoom, validFeedback, finishFeedback } = require('../session-rules');
 
 const first = { email: 'candidate@example.test', name: 'Ada', languages: ['JavaScript'], slots: ['2030-01-01T10:00:00.000Z'], interviewType: 'Frontend', experience: 'Intermediate', spokenLanguage: 'English' };
 const second = { ...first, email: 'interviewer@example.test', name: 'Sam' };
@@ -62,19 +62,19 @@ test('candidates see the active shared prompt without interviewer hints', () => 
   assert.equal(Object.hasOwn(questions[second.email], 'hints'), true, 'filtering never changes stored questions');
 });
 
-test('legacy peer sessions last 90 minutes and transfer the prompt and hints at 45 minutes', () => {
+test('peer sessions last 45 minutes and transfer the prompt and hints halfway through', () => {
   const match = interview('peer', 'in_progress');
   match.sessionStartedAt = new Date(started).toISOString();
   assert.equal(publicMatch(match, first.email, started).practiceMode, 'peer');
-  assert.equal(publicMatch(match, first.email, started).durationMinutes, 90);
-  assert.equal(sessionDetails(match, first.email, started + 45 * 60 * 1000 - 1).role, 'interviewer');
-  assert.equal(sessionDetails(match, first.email, started + 45 * 60 * 1000).role, 'candidate');
-  assert.equal(sessionDetails(match, second.email, started + 45 * 60 * 1000).role, 'interviewer');
+  assert.equal(publicMatch(match, first.email, started).durationMinutes, 45);
+  assert.equal(sessionDetails(match, first.email, started + PEER_SWITCH_MS - 1).role, 'interviewer');
+  assert.equal(sessionDetails(match, first.email, started + PEER_SWITCH_MS).role, 'candidate');
+  assert.equal(sessionDetails(match, second.email, started + PEER_SWITCH_MS).role, 'interviewer');
   assert.equal(currentQuestion(match, second.email, started).prompt, questions[first.email].prompt);
   assert.equal(currentQuestion(match, second.email, started).hints, undefined);
-  assert.equal(currentQuestion(match, first.email, started + 45 * 60 * 1000).prompt, questions[second.email].prompt);
-  assert.equal(currentQuestion(match, first.email, started + 45 * 60 * 1000).hints, undefined);
-  assert.deepEqual(currentQuestion(match, second.email, started + 45 * 60 * 1000).hints, ['Private hint two']);
+  assert.equal(currentQuestion(match, first.email, started + PEER_SWITCH_MS).prompt, questions[second.email].prompt);
+  assert.equal(currentQuestion(match, first.email, started + PEER_SWITCH_MS).hints, undefined);
+  assert.deepEqual(currentQuestion(match, second.email, started + PEER_SWITCH_MS).hints, ['Private hint two']);
 });
 
 test('legacy match without question or feedback records still restores safely', () => {
@@ -87,6 +87,20 @@ test('legacy match without question or feedback records still restores safely', 
   assert.equal(result.selfFeedback, null);
   assert.ok(result.question.prompt);
   assert.equal(result.question.hints, undefined);
+});
+
+test('scheduled rooms open ten minutes early without leaking hosted-video credentials', () => {
+  const match = interview('directed');
+  match.mediaProvider = 'daily';
+  const elevenMinutesEarly = started - 11 * 60 * 1000;
+  const tenMinutesEarly = started - 10 * 60 * 1000;
+  const early = publicMatch(match, first.email, elevenMinutesEarly);
+  const open = publicMatch(match, first.email, tenMinutesEarly);
+  assert.equal(early.canJoinNow, false);
+  assert.equal(open.canJoinNow, true);
+  assert.equal(open.videoProvider, 'daily');
+  assert.equal(Object.hasOwn(open, 'token'), false);
+  assert.equal(Object.hasOwn(open, 'roomUrl'), false);
 });
 
 const feedbackInput = { scores: [5, 4, 3], strength: 'Clear examples.', improve: 'Explain each step.', practiseAgain: true };

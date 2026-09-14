@@ -1,14 +1,18 @@
 const path = require('path');
 const fs = require('fs');
+const { randomUUID } = require('crypto');
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const { PRACTICE_MODES, HALF_SESSION_MS, practiceMode, compatibleModes, sessionMode, sessionDetails, currentQuestion, isParticipant, canUseRoom, validFeedback, feedbackWithCriteria, finishFeedback } = require('./session-rules');
+const { PRACTICE_MODES, SESSION_DURATION_MS, PEER_SWITCH_MS, practiceMode, compatibleModes, sessionMode, sessionDetails, currentQuestion, isParticipant, canUseRoom, validFeedback, feedbackWithCriteria, finishFeedback } = require('./session-rules');
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://qjghjsapizkqktcbczgj.supabase.co';
 const SUPABASE_PUBLISHABLE_KEY = process.env.SUPABASE_PUBLISHABLE_KEY || 'sb_publishable_LPppVZWRepW4yHykfUS2EQ_sH9dwksM';
 const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+const DAILY_API_KEY = process.env.DAILY_API_KEY || '';
 const APP_URL = process.env.APP_URL || 'http://localhost:3000';
+const JOIN_EARLY_MS = 10 * 60 * 1000;
+const JOIN_GRACE_MS = 15 * 60 * 1000;
 const allowedOrigins = (process.env.FRONTEND_ORIGIN || '').split(',').map(origin => origin.trim()).filter(Boolean);
 
 const app = express();
@@ -96,6 +100,7 @@ const questionBank = {
 const levels = ['Beginner', 'Intermediate', 'Advanced'];
 const online = new Map();
 const sessionTimers = new Map();
+const dailyRoomPromises = new Map();
 
 function addOnline(email, socketId) {
   if (!online.has(email)) online.set(email, new Set());
@@ -119,13 +124,133 @@ function slotsFor(profile) { return cleanList(profile.slots?.length ? profile.sl
 function sharedSlots(a, b) { const other = new Set(slotsFor(b)); return slotsFor(a).filter(slot => other.has(slot)).sort(); }
 function sharedSkills(a, b) { const other = new Set(b.languages || []); return (a.languages || []).filter(skill => other.has(skill)); }
 function activeMatchFor(email) {
+  expireStaleMatches();
   return Object.values(db.matches).find(match => ['matched', 'in_progress', 'feedback_pending'].includes(match.status) && match.people.some(person => person.email === email));
+}
+function expireStaleMatches(now = Date.now()) {
+  let changed = false;
+  Object.values(db.matches).forEach(match => {
+    if (match.status !== 'matched') return;
+    const start = Date.parse(match.sharedSlot);
+    if (!Number.isFinite(start) || now <= start + JOIN_GRACE_MS) return;
+    match.status = 'expired'; match.expiredAt = new Date(now).toISOString(); changed = true;
+    match.people.forEach(person => { if (db.profiles[person.email]?.status === 'matched') db.profiles[person.email].status = 'idle'; });
+  });
+  if (changed) { save(); io.emit('listings-updated'); }
 }
 function pruneQueue() {
   const expiry = Date.now() - 90 * 60 * 1000;
   Object.values(db.profiles).forEach(profile => {
     if (profile.status === 'waiting' && !slotsFor(profile).some(slot => new Date(slot).getTime() > expiry)) profile.status = 'expired';
   });
+}
+
+function listingRolesFor(mode) {
+  if (mode === 'candidate') return ['interviewer'];
+  if (mode === 'interviewer') return ['candidate'];
+  return ['peer'];
+}
+
+function waitingProfile(email, input) {
+  if (input?.practiceMode != null && !PRACTICE_MODES.includes(input.practiceMode)) return { error: 'Choose peer practice, candidate, or interviewer mode.' };
+  const previous = db.profiles[email] || {};
+  const profile = {
+    email,
+    listingId: previous.status === 'waiting' && previous.listingId ? previous.listingId : `listing-${randomUUID()}`,
+    name: cleanText(input?.name, 40),
+    languages: cleanList(input?.languages, null, 12),
+    slots: cleanList(input?.slots, null, 3),
+    interviewType: questionBank[input?.interviewType] ? input.interviewType : '',
+    experience: levels.includes(input?.experience) ? input.experience : 'Beginner',
+    spokenLanguage: ['English', 'Hindi', 'English + Hindi'].includes(input?.spokenLanguage) ? input.spokenLanguage : 'English',
+    practiceMode: practiceMode(input),
+    timezone: cleanText(input?.timezone, 60),
+    status: 'waiting',
+    stats: previous.stats || { sessionsCompleted: 0, ratingTotal: 0, averageRating: 0 },
+    updatedAt: new Date().toISOString()
+  };
+  if (!profile.name || !profile.languages.length || !profile.slots.length || !profile.interviewType) return { error: 'Please complete all matching preferences.' };
+  if (profile.slots.some(slot => !Number.isFinite(Date.parse(slot)) || Date.parse(slot) <= Date.now())) return { error: 'Choose an upcoming session time. Your previous time may have passed.' };
+  profile.slots = [...new Set(profile.slots.map(slot => new Date(slot).toISOString()))].sort();
+  return { profile };
+}
+
+function publicListing(profile) {
+  return {
+    listingId: profile.listingId,
+    name: profile.name,
+    languages: [...(profile.languages || [])],
+    slots: slotsFor(profile).filter(slot => Date.parse(slot) > Date.now()),
+    interviewType: profile.interviewType,
+    experience: profile.experience,
+    spokenLanguage: profile.spokenLanguage,
+    practiceMode: practiceMode(profile),
+    timezone: profile.timezone,
+    sessionsCompleted: Number(profile.stats?.sessionsCompleted) || 0,
+    createdAt: profile.updatedAt
+  };
+}
+
+function listingsFor(email) {
+  pruneQueue();
+  const viewer = db.profiles[email];
+  if (!viewer) return [];
+  const targetRoles = listingRolesFor(practiceMode(viewer));
+  return Object.values(db.profiles)
+    .filter(profile => profile.email !== email && profile.status === 'waiting' && targetRoles.includes(practiceMode(profile)))
+    .map(publicListing)
+    .filter(listing => listing.slots.length)
+    .sort((first, second) => Date.parse(first.slots[0]) - Date.parse(second.slots[0]));
+}
+
+function createMatch(first, second, options = {}) {
+  const roomId = `room-${Date.now()}-${randomUUID().slice(0, 8)}`;
+  const interviewType = options.interviewType || first.interviewType;
+  const sharedLanguages = sharedSkills(first, second);
+  const match = {
+    id: roomId,
+    people: [{ ...first }, { ...second }],
+    score: options.score === null ? null : (Number(options.score) || 100),
+    reasons: options.reasons || ['Session selected by you', `${interviewType} focus`, 'A time that works for you'],
+    sharedSlot: options.sharedSlot,
+    interviewType,
+    bookingType: options.bookingType || 'automatic',
+    source: options.bookingType || 'automatic',
+    listingId: options.listingId || null,
+    scheduledStart: options.sharedSlot,
+    mediaProvider: DAILY_API_KEY ? 'daily' : 'webrtc',
+    sessionMode: practiceMode(first) === 'peer' ? 'peer' : 'directed',
+    durationMinutes: 45,
+    status: 'matched',
+    createdAt: new Date().toISOString(),
+    questions: { [first.email]: questionFor(interviewType, 0), [second.email]: questionFor(interviewType, 1) },
+    workspace: { code: '', language: sharedLanguages[0] || second.languages?.[0] || first.languages?.[0] || 'JavaScript', version: 0 },
+    chat: [],
+    feedback: {}
+  };
+  db.matches[roomId] = match;
+  if (db.profiles[first.email]) db.profiles[first.email].status = 'matched';
+  if (db.profiles[second.email]) db.profiles[second.email].status = 'matched';
+  return match;
+}
+
+function announceMatch(match) {
+  match.people.forEach(person => {
+    const peer = match.people.find(other => other.email !== person.email);
+    notify(person, 'Your Mocksyra session is booked', `Your 45-minute ${match.interviewType} session with ${peer.name} is confirmed.`, match.id);
+    emitToEmail(person.email, 'match-found', publicMatch(match, person.email));
+  });
+  io.emit('listings-updated');
+}
+
+function joinWindow(match, now = Date.now()) {
+  const start = Date.parse(match?.sharedSlot);
+  const duration = (Number(match?.durationMinutes) || 45) * 60 * 1000;
+  if (!Number.isFinite(start)) return { canJoinNow: false, opensAt: null, closesAt: null };
+  const opensAt = start - JOIN_EARLY_MS;
+  const sessionStart = Date.parse(match?.sessionStartedAt);
+  const closesAt = match?.status === 'in_progress' && Number.isFinite(sessionStart) ? sessionStart + duration : start + JOIN_GRACE_MS;
+  return { canJoinNow: now >= opensAt && now <= closesAt, opensAt: new Date(opensAt).toISOString(), closesAt: new Date(closesAt).toISOString() };
 }
 
 function compatibility(a, b) {
@@ -175,6 +300,12 @@ function publicMatch(match, email, now = Date.now()) {
     interviewType: match.interviewType,
     ...sessionDetails(match, email, now),
     question: currentQuestion(match, email, now, questionFor(match.interviewType, 0)),
+    bookingType: match.bookingType || 'automatic',
+    source: match.source || match.bookingType || 'automatic',
+    listingId: match.listingId || null,
+    scheduledStart: match.scheduledStart || match.sharedSlot,
+    videoProvider: match.mediaProvider || 'webrtc',
+    ...joinWindow(match, now),
     status: match.status,
     selfFeedback: feedbackWithCriteria(match, email),
     feedbackSubmitted: Boolean(match.feedback?.[email])
@@ -223,12 +354,12 @@ function scheduleSessionTimers(match) {
   if (match.status !== 'in_progress' || !match.sessionStartedAt) return;
   const started = Date.parse(match.sessionStartedAt);
   if (!Number.isFinite(started)) return;
-  const duration = sessionMode(match) === 'directed' ? HALF_SESSION_MS : HALF_SESSION_MS * 2;
+  const duration = SESSION_DURATION_MS;
   const remaining = started + duration - Date.now();
   if (remaining <= 0) { finishSession(match); return; }
   const timers = [];
-  if (duration === HALF_SESSION_MS * 2 && started + HALF_SESSION_MS > Date.now()) {
-    timers.push(setTimeout(() => { if (match.status === 'in_progress') emitSessionState(match, 'session-phase'); }, started + HALF_SESSION_MS - Date.now()));
+  if (sessionMode(match) === 'peer' && started + PEER_SWITCH_MS > Date.now()) {
+    timers.push(setTimeout(() => { if (match.status === 'in_progress') emitSessionState(match, 'session-phase'); }, started + PEER_SWITCH_MS - Date.now()));
   }
   timers.push(setTimeout(() => finishSession(match), remaining));
   timers.forEach(timer => timer.unref());
@@ -236,8 +367,8 @@ function scheduleSessionTimers(match) {
 }
 
 function acknowledge(callback, packet) { if (typeof callback === 'function') callback(packet); }
-function reject(socket, callback, error) {
-  acknowledge(callback, { ok: false, error });
+function reject(socket, callback, error, details = {}) {
+  acknowledge(callback, { ok: false, error, ...details });
   if (typeof callback !== 'function') socket.emit('app-error', error);
 }
 
@@ -251,6 +382,55 @@ async function sendEmail(profile, title, body) {
     });
     if (!response.ok) console.error('Email delivery failed:', response.status);
   } catch (error) { console.error('Email delivery failed:', error.message); }
+}
+
+async function dailyRequest(pathname, body) {
+  const response = await fetch(`https://api.daily.co/v1/${pathname}`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${DAILY_API_KEY}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(payload.info || payload.error || `Daily API returned HTTP ${response.status}`);
+  return payload;
+}
+
+async function ensureDailyRoom(match) {
+  if (!DAILY_API_KEY || match.mediaProvider !== 'daily') return null;
+  if (match.dailyRoom?.url) return match.dailyRoom;
+  if (dailyRoomPromises.has(match.id)) return dailyRoomPromises.get(match.id);
+  const promise = (async () => {
+    const exp = Math.floor((Date.parse(match.sharedSlot) + SESSION_DURATION_MS + JOIN_GRACE_MS) / 1000);
+    const nbf = Math.floor((Date.parse(match.sharedSlot) - JOIN_EARLY_MS) / 1000);
+    const room = await dailyRequest('rooms', {
+      name: match.id.replace(/[^a-zA-Z0-9_-]/g, '-').slice(0, 120),
+      privacy: 'private',
+      properties: { nbf, exp, eject_at_room_exp: true, enforce_unique_user_ids: true, enable_prejoin_ui: true, enable_screenshare: true, enable_network_ui: true, enable_chat: false, max_participants: 2 }
+    });
+    match.dailyRoom = { name: room.name, url: room.url, exp };
+    save();
+    return match.dailyRoom;
+  })().finally(() => dailyRoomPromises.delete(match.id));
+  dailyRoomPromises.set(match.id, promise);
+  return promise;
+}
+
+async function dailyAccessFor(match, person, userId) {
+  const room = await ensureDailyRoom(match);
+  if (!room) return { provider: 'webrtc' };
+  const token = await dailyRequest('meeting-tokens', {
+    properties: {
+      room_name: room.name,
+      user_name: person.name,
+      user_id: userId,
+      nbf: Math.floor((Date.parse(match.sharedSlot) - JOIN_EARLY_MS) / 1000),
+      exp: room.exp,
+      is_owner: false,
+      eject_at_token_exp: true,
+      enable_prejoin_ui: true
+    }
+  });
+  return { provider: 'daily', roomUrl: room.url, token: token.token, expiresAt: new Date(room.exp * 1000).toISOString() };
 }
 
 function notify(profile, title, body, matchId) {
@@ -299,8 +479,47 @@ io.on('connection', socket => {
     const state = profileStateFor(email);
     socket.emit('profile-state', state);
     if (state.activeMatch) socket.emit('match-found', state.activeMatch);
+    socket.emit('session-listings', listingsFor(email));
     socket.emit('notifications', state.notifications);
     socket.emit('history', state.history);
+  });
+
+  socket.on('publish-listing', (input, callback) => {
+    if (activeMatchFor(email)) return reject(socket, callback, 'You already have a booked session. Open it before publishing another time.');
+    const result = waitingProfile(email, input);
+    if (result.error) return reject(socket, callback, result.error);
+    db.profiles[email] = result.profile;
+    save();
+    acknowledge(callback, { ok: true, profile: { ...result.profile }, listings: listingsFor(email), serverNow: new Date().toISOString() });
+    socket.emit('session-listings', listingsFor(email));
+    io.emit('listings-updated');
+  });
+
+  socket.on('browse-listings', (_, callback) => {
+    acknowledge(callback, { ok: true, listings: listingsFor(email), serverNow: new Date().toISOString() });
+  });
+
+  socket.on('book-listing', (packet, callback) => {
+    if (activeMatchFor(email)) return reject(socket, callback, 'You already have a booked session.');
+    const profile = db.profiles[email];
+    if (!profile || profile.status !== 'waiting') return reject(socket, callback, 'Publish your availability before booking a session.');
+    const listingId = cleanText(packet?.listingId, 100);
+    const target = Object.values(db.profiles).find(candidate => candidate.email !== email && candidate.listingId === listingId);
+    if (!target || target.status !== 'waiting') return reject(socket, callback, 'That session was just booked or is no longer available. Refresh to see current sessions.');
+    if (!compatibleModes(profile, target)) return reject(socket, callback, 'Choose a complementary candidate or interviewer session.');
+    const slot = cleanText(packet?.slot, 60);
+    if (!slotsFor(target).includes(slot) || Date.parse(slot) <= Date.now()) return reject(socket, callback, 'That time is no longer available.');
+    const match = createMatch(profile, target, {
+      sharedSlot: new Date(slot).toISOString(),
+      interviewType: target.interviewType,
+      bookingType: 'marketplace',
+      listingId,
+      score: null,
+      reasons: ['Session selected by you', `${target.interviewType} focus`, `${target.languages.join(', ')} practice`]
+    });
+    save();
+    acknowledge(callback, { ok: true, activeMatch: publicMatch(match, email) });
+    announceMatch(match);
   });
 
   socket.on('find-match', (input, callback) => {
@@ -309,61 +528,21 @@ io.on('connection', socket => {
       acknowledge(callback, { ok: true, activeMatch: publicMatch(active, email) });
       return socket.emit('match-found', publicMatch(active, email));
     }
-    if (input?.practiceMode != null && !PRACTICE_MODES.includes(input.practiceMode)) return reject(socket, callback, 'Choose peer practice, candidate, or interviewer mode.');
-    const oldStats = db.profiles[email]?.stats || { sessionsCompleted: 0, ratingTotal: 0, averageRating: 0 };
-    const profile = {
-      email,
-      name: cleanText(input?.name, 40),
-      languages: cleanList(input?.languages, null, 12),
-      slots: cleanList(input?.slots, null, 3),
-      interviewType: questionBank[input?.interviewType] ? input.interviewType : '',
-      experience: levels.includes(input?.experience) ? input.experience : 'Beginner',
-      spokenLanguage: ['English', 'Hindi', 'English + Hindi'].includes(input?.spokenLanguage) ? input.spokenLanguage : 'English',
-      practiceMode: practiceMode(input),
-      timezone: cleanText(input?.timezone, 60),
-      status: 'waiting',
-      stats: oldStats,
-      updatedAt: new Date().toISOString()
-    };
-    if (!profile.name || !profile.languages.length || !profile.slots.length || !profile.interviewType) return reject(socket, callback, 'Please complete all matching preferences.');
-    if (profile.slots.some(slot => !Number.isFinite(Date.parse(slot)) || Date.parse(slot) <= Date.now())) return reject(socket, callback, 'Choose an upcoming session time. Your previous time may have passed.');
-    profile.slots = [...new Set(profile.slots.map(slot => new Date(slot).toISOString()))];
+    const prepared = input?.name ? waitingProfile(email, input) : { profile: db.profiles[email] };
+    if (!prepared.profile || prepared.error) return reject(socket, callback, prepared.error || 'Publish your availability before asking for an automatic match.');
+    const profile = prepared.profile;
     db.profiles[email] = profile;
     const found = bestMatch(profile);
-    if (!found) { save(); acknowledge(callback, { ok: true, waiting: true, profile }); return socket.emit('match-waiting'); }
-
-    const roomId = `room-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    const match = {
-      id: roomId,
-      people: [profile, found.candidate],
-      score: found.result.value,
-      reasons: found.result.reasons,
-      sharedSlot: found.result.sharedSlot,
-      interviewType: profile.interviewType,
-      sessionMode: profile.practiceMode === 'peer' ? 'peer' : 'directed',
-      durationMinutes: profile.practiceMode === 'peer' ? 90 : 45,
-      status: 'matched',
-      createdAt: new Date().toISOString(),
-      questions: { [profile.email]: questionFor(profile.interviewType, 0), [found.candidate.email]: questionFor(profile.interviewType, 1) },
-      workspace: { code: '', language: profile.languages[0] || 'JavaScript', version: 0 },
-      chat: [],
-      feedback: {}
-    };
-    db.matches[roomId] = match;
-    db.profiles[profile.email].status = 'matched';
-    db.profiles[found.candidate.email].status = 'matched';
+    if (!found) { save(); acknowledge(callback, { ok: true, waiting: true, profile }); socket.emit('match-waiting'); return io.emit('listings-updated'); }
+    const match = createMatch(profile, found.candidate, { sharedSlot: found.result.sharedSlot, score: found.result.value, reasons: found.result.reasons });
     save();
     acknowledge(callback, { ok: true, activeMatch: publicMatch(match, email) });
-    match.people.forEach(person => {
-      const peer = match.people.find(other => other.email !== person.email);
-      notify(person, 'Your Mocksyra match is ready', `You matched with ${peer.name} for ${match.interviewType} at the same available time.`, roomId);
-      emitToEmail(person.email, 'match-found', publicMatch(match, person.email));
-    });
+    announceMatch(match);
   });
 
   socket.on('cancel-search', callback => {
     if (activeMatchFor(email)) return reject(socket, callback, 'A match is already ready. Open it to join or cancel.');
-    if (db.profiles[email]?.status === 'waiting') { db.profiles[email].status = 'idle'; save(); }
+    if (db.profiles[email]?.status === 'waiting') { db.profiles[email].status = 'idle'; save(); io.emit('listings-updated'); }
     acknowledge(callback, { ok: true });
   });
 
@@ -379,13 +558,33 @@ io.on('connection', socket => {
     });
     save();
     match.people.forEach(person => emitToEmail(person.email, 'match-cancelled', { roomId, message: 'This match was cancelled. You can choose new preferences and find another match.' }));
+    io.emit('listings-updated');
     io.in(roomId).socketsLeave(roomId);
     acknowledge(callback, { ok: true });
+  });
+
+  socket.on('prepare-call', async (packet, callback) => {
+    const roomId = cleanText(typeof packet === 'object' ? packet?.roomId : packet, 100);
+    const match = authorizedMatch(socket, roomId);
+    if (!match || !['matched', 'in_progress'].includes(match.status)) return reject(socket, callback, 'This interview room is unavailable.');
+    const window = joinWindow(match);
+    if (!window.canJoinNow) return reject(socket, callback, `This room opens 10 minutes before the scheduled session.`, { code: 'TOO_EARLY', ...window });
+    if (match.mediaProvider !== 'daily') return acknowledge(callback, { ok: true, provider: 'webrtc', ...window });
+    if (!DAILY_API_KEY) return reject(socket, callback, 'Hosted video is not configured for this session. Contact support or reschedule.', { code: 'DAILY_NOT_CONFIGURED' });
+    try {
+      const person = match.people.find(participant => participant.email === email);
+      const access = await dailyAccessFor(match, person, socket.data.userId);
+      acknowledge(callback, { ok: true, ...access, ...window });
+    } catch (error) {
+      console.error('Daily call preparation failed:', error.message);
+      reject(socket, callback, 'The hosted video room is temporarily unavailable. Please retry.', { code: 'VIDEO_SERVICE_UNAVAILABLE' });
+    }
   });
 
   socket.on('join-session', (roomIdValue, callback) => {
     const roomId = cleanText(roomIdValue, 100), match = authorizedMatch(socket, roomId);
     if (!match || !['matched', 'in_progress'].includes(match.status)) return reject(socket, callback, 'This interview room is unavailable.');
+    if (match.status === 'matched' && !joinWindow(match).canJoinNow) return reject(socket, callback, `This room opens 10 minutes before ${new Date(match.sharedSlot).toLocaleString('en', { timeZone: 'UTC' })} UTC.`);
     if (match.status === 'in_progress') scheduleSessionTimers(match);
     if (match.status !== 'matched' && match.status !== 'in_progress') return reject(socket, callback, 'This interview has ended. Please share your feedback.');
     socket.join(roomId);
@@ -480,7 +679,7 @@ io.on('connection', socket => {
   socket.on('disconnect', () => removeOnline(email, socket.id));
 });
 
-app.get('/health', (_, response) => response.status(200).json({ status: 'ok', persistence: SUPABASE_SECRET_KEY ? 'supabase' : 'local' }));
+app.get('/health', (_, response) => response.status(200).json({ status: 'ok', persistence: SUPABASE_SECRET_KEY ? 'supabase' : 'local', video: DAILY_API_KEY ? 'daily-ready' : 'webrtc-fallback' }));
 const publicAssets = new Set(['index.html', 'styles.css', 'call.css', 'features.css', 'design.css', 'app.js', 'auth.js', 'supabase.js', 'runtime-config.js', 'site-config.js', 'runner.html', 'runner.js']);
 app.get('*', (request, response) => {
   const asset = request.path === '/' ? 'index.html' : request.path.slice(1);

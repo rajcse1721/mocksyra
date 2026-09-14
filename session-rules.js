@@ -1,7 +1,10 @@
 const PRACTICE_MODES = ['peer', 'candidate', 'interviewer'];
 const CANDIDATE_CRITERIA = ['Problem solving', 'Communication', 'Technical depth'];
 const INTERVIEWER_CRITERIA = ['Question clarity', 'Guidance', 'Professionalism'];
-const HALF_SESSION_MS = 45 * 60 * 1000;
+const SESSION_DURATION_MS = 45 * 60 * 1000;
+const PEER_SWITCH_MS = Math.floor(SESSION_DURATION_MS / 2);
+// Kept as an export for older integrations; peer mode now switches halfway through a 45-minute session.
+const HALF_SESSION_MS = PEER_SWITCH_MS;
 
 function practiceMode(profile) {
   return PRACTICE_MODES.includes(profile?.practiceMode) ? profile.practiceMode : 'peer';
@@ -21,13 +24,13 @@ function sessionDetails(match, email, now = Date.now()) {
   const peer = match.people.find(item => item.email !== email);
   const mode = sessionMode(match);
   const started = Date.parse(match.sessionStartedAt);
-  const phase = mode === 'peer' && Number.isFinite(started) && now - started >= HALF_SESSION_MS ? 2 : 1;
+  const phase = mode === 'peer' && Number.isFinite(started) && now - started >= PEER_SWITCH_MS ? 2 : 1;
   const startsAsInterviewer = mode === 'directed' ? practiceMode(person) === 'interviewer' : match.people[0].email === email;
   const isInterviewer = phase === 2 ? !startsAsInterviewer : startsAsInterviewer;
   return {
     practiceMode: practiceMode(person),
     sessionMode: mode,
-    durationMinutes: mode === 'directed' ? 45 : 90,
+    durationMinutes: 45,
     startsAsInterviewer,
     initiator: match.people[0].email === email,
     role: isInterviewer ? 'interviewer' : 'candidate',
@@ -92,4 +95,4 @@ function finishFeedback(match, profiles, now = Date.now()) {
   return true;
 }
 
-module.exports = { PRACTICE_MODES, HALF_SESSION_MS, practiceMode, compatibleModes, sessionMode, sessionDetails, currentQuestion, isParticipant, canUseRoom, validFeedback, feedbackWithCriteria, finishFeedback };
+module.exports = { PRACTICE_MODES, SESSION_DURATION_MS, PEER_SWITCH_MS, HALF_SESSION_MS, practiceMode, compatibleModes, sessionMode, sessionDetails, currentQuestion, isParticipant, canUseRoom, validFeedback, feedbackWithCriteria, finishFeedback };
