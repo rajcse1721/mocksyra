@@ -161,6 +161,9 @@ function fakeSocketSDK() {
         if (event === 'match-found' && payload?.roomId) {
           socket.activeMatches = [...socket.activeMatches.filter(item => item.roomId !== payload.roomId), payload];
         }
+        if (event === 'meeting-link-updated' && payload?.roomId) {
+          socket.activeMatches = [...socket.activeMatches.filter(item => item.roomId !== payload.roomId), payload];
+        }
         if (event === 'match-cancelled' && payload?.roomId) {
           socket.activeMatches = socket.activeMatches.filter(item => item.roomId !== payload.roomId);
         }
@@ -229,6 +232,16 @@ function fakeSocketSDK() {
           socket.activeMatches = socket.activeMatches.filter(item => item.roomId !== roomId);
           if (typeof ack === 'function') ack({ ok: true, activeMatches: socket.activeMatches, upcomingMatches: socket.activeMatches, ownListings: socket.ownListings });
           queueMicrotask(() => socket.receive('match-cancelled', { roomId, message: 'This interview was cancelled.' }));
+          return socket;
+        }
+        if (event === 'set-meeting-link') {
+          const selected = socket.activeMatches.find(item => item.roomId === payload?.roomId);
+          if (!selected || selected.practiceMode !== 'interviewer') { if (typeof ack === 'function') ack({ ok: false, error: 'Only the interviewer can add or change the meeting link.' }); return socket; }
+          const provider = String(payload.meetingUrl).includes('teams.') ? 'teams' : 'zoom';
+          const match = { ...selected, videoProvider: 'external', meetingProvider: provider, meetingUrl: payload.meetingUrl };
+          socket.activeMatches = [...socket.activeMatches.filter(item => item.roomId !== match.roomId), match];
+          if (typeof ack === 'function') ack({ ok: true, match, activeMatch: match, activeMatches: socket.activeMatches, upcomingMatches: socket.activeMatches, ownListings: socket.ownListings });
+          queueMicrotask(() => socket.receive('meeting-link-updated', match));
           return socket;
         }
         if (event === 'prepare-call') { if (typeof ack === 'function') ack(window.__fixtureHostedVideo ? { ok: true, provider: 'daily', roomUrl: 'https://fixture.daily.test/private-room', token: 'short-lived-fixture-token' } : { ok: true, provider: 'webrtc' }); return socket; }
@@ -1116,6 +1129,81 @@ async function verifyHostedVideo() {
   await page.context().close();
 }
 
+async function openExternalFixture(page, practiceMode, meetingUrl = null, videoProvider = 'external') {
+  await page.goto(`${origin}/#marketplace`);
+  await page.locator('#marketplace-results').waitFor();
+  const profile = { name: practiceMode === 'interviewer' ? 'Alex Interviewer' : 'Alex Candidate', email: 'fixture@example.test', practiceMode, languages: ['JavaScript'], interviewType: 'Frontend', experience: 'Intermediate', spokenLanguage: 'English', timezone: 'Asia/Kolkata', status: 'idle' };
+  const match = { ...fixtureMatch(practiceMode), roomId: `fixture-external-${practiceMode}`, videoProvider, meetingProvider: meetingUrl ? (meetingUrl.includes('teams.') ? 'teams' : 'zoom') : null, meetingUrl };
+  await page.evaluate(({ profile, match }) => {
+    window.__mocksyraSocket.profile = profile;
+    window.__mocksyraSocket.activeMatches = [match];
+    return window.__mocksyraSocket.receive('profile-state', { profile, activeMatch: match, activeMatches: [match], upcomingMatches: [match], ownListings: [], history: [], notifications: [] });
+  }, { profile, match });
+  await page.locator(`[data-open-match="${match.roomId}"]`).click();
+  return match;
+}
+
+async function verifyExternalMeetings() {
+  const interviewerPage = await newPage();
+  await openExternalFixture(interviewerPage, 'interviewer');
+  assert.equal(await interviewerPage.locator('#test-devices').count(), 0, 'external meetings do not ask Mocksyra for camera access');
+  await interviewerPage.locator('#meeting-url').fill('https://teams.live.com/meet/123456789');
+  await interviewerPage.locator('#save-meeting-link').click();
+  await interviewerPage.locator('#join[href*="teams.live.com"]').waitFor();
+  assert.match(await interviewerPage.locator('.meeting-note').innerText(), /Zoom Basic.*40 minutes/i);
+  assert.equal(await interviewerPage.locator('#join').getAttribute('target'), '_blank');
+  await screenshot(interviewerPage, 'meeting-link-interviewer-desktop');
+  await interviewerPage.setViewportSize({ width: 390, height: 844 });
+  await checkOverflow(interviewerPage, 'external meeting setup mobile');
+  await screenshot(interviewerPage, 'meeting-link-interviewer-mobile');
+  await interviewerPage.context().close();
+
+  const migrationPage = await newPage();
+  const legacyMatch = await openExternalFixture(migrationPage, 'candidate', null, 'webrtc');
+  await migrationPage.locator('#test-devices').click();
+  await migrationPage.waitForFunction(() => document.querySelector('#device-preview')?.srcObject?.active);
+  const migratedMatch = { ...legacyMatch, videoProvider: 'external', meetingProvider: 'teams', meetingUrl: 'https://teams.live.com/meet/246813579' };
+  await migrationPage.evaluate(match => {
+    const socket = window.__mocksyraSocket;
+    socket.activeMatches = [match];
+    return socket.receive('profile-state', { profile: socket.profile, activeMatch: match, activeMatches: [match], upcomingMatches: [match], ownListings: [], history: [], notifications: [] });
+  }, migratedMatch);
+  await migrationPage.locator('.meeting-link-status.ready').waitFor();
+  assert.equal(await migrationPage.evaluate(() => window.__mediaTracks.every(track => track.readyState === 'ended')), true, 'provider migration stops a hidden legacy camera and microphone preview');
+  await migrationPage.context().close();
+
+  const candidatePage = await newPage();
+  const candidateMatch = await openExternalFixture(candidatePage, 'candidate');
+  assert.match(await candidatePage.locator('.meeting-link-status').innerText(), /waiting for the meeting link/i);
+  assert.equal(await candidatePage.locator('#meeting-link-form').count(), 0, 'candidates cannot edit the meeting link');
+  const readyMatch = { ...candidateMatch, meetingProvider: 'zoom', meetingUrl: 'https://zoom.us/j/123456789?pwd=fixture' };
+  await candidatePage.evaluate(match => {
+    const socket = window.__mocksyraSocket;
+    socket.activeMatches = [match];
+    return socket.receive('profile-state', { profile: socket.profile, activeMatch: match, activeMatches: [match], upcomingMatches: [match], ownListings: [], history: [], notifications: [] });
+  }, readyMatch);
+  await candidatePage.locator('#join[href*="zoom.us"]').waitFor();
+  const popupPromise = candidatePage.waitForEvent('popup').catch(() => null);
+  await candidatePage.locator('#join').click();
+  const popup = await popupPromise;
+  if (popup) await popup.close().catch(() => {});
+  await candidatePage.waitForURL('**/#session');
+  await candidatePage.locator('.external-meeting-card').waitFor();
+  await candidatePage.locator('#workspace-panel:not([hidden])').waitFor();
+  assert.equal(await candidatePage.locator('.call-stage').count(), 0, 'the failed embedded-video surface is removed');
+  assert.equal(await candidatePage.locator('#local, #remote').count(), 0, 'external sessions never request local WebRTC video elements');
+  await candidatePage.waitForFunction(roomId => window.__mocksyraSocket.joinedRooms.has(roomId), candidateMatch.roomId);
+  await screenshot(candidatePage, 'session-external-desktop');
+  const beforeReconnect = await candidatePage.evaluate(() => window.__mocksyraSocket.sent.filter(item => item.event === 'join-session').length);
+  await candidatePage.evaluate(() => { window.__mocksyraSocket.disconnect(); window.__mocksyraSocket.connect(); });
+  await candidatePage.waitForFunction(({ beforeReconnect, roomId }) => window.__mocksyraSocket.sent.filter(item => item.event === 'join-session').length === beforeReconnect + 1 && window.__mocksyraSocket.joinedRooms.has(roomId), { beforeReconnect, roomId: candidateMatch.roomId });
+  await candidatePage.setViewportSize({ width: 390, height: 844 });
+  await checkOverflow(candidatePage, 'external workspace mobile');
+  await screenshot(candidatePage, 'session-external-mobile');
+  report.checks.push('Interviewer-managed Zoom or Teams links stay private, open externally, and keep the shared workspace connected');
+  await candidatePage.context().close();
+}
+
 async function verifyHistory() {
   const page = await newPage();
   await page.goto(`${origin}/#activity`);
@@ -1145,7 +1233,7 @@ async function verifyHistory() {
   origin = `http://127.0.0.1:${server.address().port}`;
   try {
     browser = await playwright.chromium.launch({ channel: process.env.MOCKSYRA_BROWSER_CHANNEL || 'chrome', headless: true });
-    for (const [name, run] of [['guest', verifyGuest], ['google-callback', verifyGoogleCallback], ['realtime-recovery', verifyRealtimeRecovery], ['hosted-video-cold-start', verifyHostedVideoColdStart], ['stale-hosted-restore', verifyStaleHostedRestore], ['auth-handshake-recovery', verifyAuthHandshakeRecovery], ['logout-failure', verifyLogoutFailure], ['auth-lifecycle', verifyAuthLifecycle], ['webrtc-rejection', verifyRejectedWebRtcAdmission], ...['candidate', 'interviewer'].map(mode => [mode, () => verifyMode(mode)]), ['hosted-video', verifyHostedVideo], ['history', verifyHistory]]) {
+    for (const [name, run] of [['guest', verifyGuest], ['google-callback', verifyGoogleCallback], ['realtime-recovery', verifyRealtimeRecovery], ['hosted-video-cold-start', verifyHostedVideoColdStart], ['stale-hosted-restore', verifyStaleHostedRestore], ['auth-handshake-recovery', verifyAuthHandshakeRecovery], ['logout-failure', verifyLogoutFailure], ['auth-lifecycle', verifyAuthLifecycle], ['webrtc-rejection', verifyRejectedWebRtcAdmission], ...['candidate', 'interviewer'].map(mode => [mode, () => verifyMode(mode)]), ['hosted-video', verifyHostedVideo], ['external-meetings', verifyExternalMeetings], ['history', verifyHistory]]) {
       try { await run(); process.stdout.write(`PASS ${name}\n`); }
       catch (error) { report.errors.push(`${name}: ${error.stack}`); process.stderr.write(`FAIL ${name}: ${error.message}\n`); }
     }

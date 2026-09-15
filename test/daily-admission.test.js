@@ -40,7 +40,7 @@ async function connectSocket(baseUrl, token) {
   };
 }
 
-test('Daily credentials are returned only when admission is still valid after the external API awaits', { timeout: 25_000 }, async t => {
+test('new bookings use external meeting links even when a legacy Daily key is configured', { timeout: 25_000 }, async t => {
   const fixtureDirectory = fs.mkdtempSync(path.join(os.tmpdir(), 'mocksyra-daily-admission-'));
   const clients = [];
   let child;
@@ -129,22 +129,26 @@ test('Daily credentials are returned only when admission is still valid after th
   const booked = await interviewer.ack('book-listing', { listingId: offer.listing.listingId, slot, profile: { name: 'Daily Interviewer' } });
   assert.equal(booked.ok, true);
   const roomId = booked.activeMatch.roomId;
+  assert.equal(booked.activeMatch.videoProvider, 'external');
+  assert.equal(booked.activeMatch.meetingUrl, null);
 
   const normalAccess = await candidate.ack('prepare-call', { roomId });
   assert.equal(normalAccess.ok, true);
-  assert.equal(normalAccess.provider, 'daily');
-  assert.match(normalAccess.token, /^daily-fixture-token-/);
+  assert.equal(normalAccess.provider, 'external');
+  assert.equal(normalAccess.meetingUrl, null);
+  assert.equal(tokenSequence, 0, 'new bookings never request Daily rooms or tokens');
 
-  blockTokens = true;
-  const tokenObserved = new Promise(resolve => { tokenObservedResolve = resolve; });
-  const delayedAccess = candidate.ack('prepare-call', { roomId });
-  await tokenObserved;
+  assert.equal((await candidate.ack('set-meeting-link', { roomId, meetingUrl: 'https://zoom.us/j/123456789' })).ok, false);
+  const saved = await interviewer.ack('set-meeting-link', { roomId, meetingUrl: 'https://zoom.us/j/123456789?pwd=test' });
+  assert.equal(saved.ok, true);
+  assert.equal(saved.match.meetingProvider, 'zoom');
+  const withLink = await candidate.ack('prepare-call', { roomId });
+  assert.equal(withLink.provider, 'external');
+  assert.equal(withLink.meetingUrl, 'https://zoom.us/j/123456789?pwd=test');
   const cancelled = await interviewer.ack('cancel-match', roomId);
   assert.equal(cancelled.ok, true);
-  blockTokens = false;
-  pendingTokenResponses.splice(0).forEach(send => send());
-  const staleAccess = await delayedAccess;
+  const staleAccess = await candidate.ack('prepare-call', { roomId });
   assert.equal(staleAccess.ok, false);
-  assert.match(staleAccess.error, /no longer available/i);
-  assert.equal(Object.hasOwn(staleAccess, 'token'), false, 'a token minted during a cancellation race is never delivered to the browser');
+  assert.match(staleAccess.error, /unavailable/i);
+  assert.equal(tokenSequence, 0, 'Daily stays unused throughout the external-link workflow');
 });

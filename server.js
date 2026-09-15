@@ -67,8 +67,17 @@ function migrateLegacyState() {
   });
   Object.values(db.matches || {}).forEach(match => {
     const legacyRoles = match.people?.some(person => !PRACTICE_MODES.includes(person.practiceMode));
-    if (!legacyRoles || !['matched', 'in_progress', 'feedback_pending'].includes(match.status)) return;
-    match.status = 'expired'; match.expiredAt = new Date().toISOString(); changed = true;
+    if (legacyRoles && ['matched', 'in_progress', 'feedback_pending'].includes(match.status)) {
+      match.status = 'expired'; match.expiredAt = new Date().toISOString(); changed = true;
+      return;
+    }
+    if (match.status === 'matched' && match.mediaProvider !== 'external') {
+      match.mediaProvider = 'external';
+      match.meetingProvider = null;
+      match.meetingUrl = null;
+      if (Object.hasOwn(match, 'dailyRoom')) delete match.dailyRoom;
+      changed = true;
+    }
   });
   return changed;
 }
@@ -159,6 +168,22 @@ function emitToEmail(email, event, payload) {
   for (const socketId of online.get(email) || []) io.to(socketId).emit(event, payload);
 }
 function cleanText(value, maximum) { return String(value || '').trim().slice(0, maximum); }
+function meetingLinkDetails(value) {
+  const input = String(value || '').trim();
+  if (!input) return { error: 'Add a Zoom or Microsoft Teams meeting link.' };
+  if (input.length > 2048) return { error: 'The meeting link is too long.' };
+  let url;
+  try { url = new URL(input); } catch { return { error: 'Enter a complete Zoom or Microsoft Teams meeting link.' }; }
+  if (url.protocol !== 'https:' || url.username || url.password || url.port) return { error: 'Meeting links must use a standard secure https address.' };
+  const host = url.hostname.toLowerCase();
+  const zoom = host === 'zoom.us' || host.endsWith('.zoom.us');
+  const teams = host === 'teams.microsoft.com' || host === 'teams.live.com';
+  if (!zoom && !teams) return { error: 'Use an official Zoom or Microsoft Teams meeting link.' };
+  if (zoom && !/^\/(?:j|my)\//i.test(url.pathname)) return { error: 'Use the Zoom participant join link, such as zoom.us/j/…' };
+  if (teams && !/^\/(?:l\/meetup-join|meet)\//i.test(url.pathname)) return { error: 'Use the Microsoft Teams meeting join link.' };
+  url.hash = '';
+  return { meetingUrl: url.href, meetingProvider: zoom ? 'zoom' : 'teams' };
+}
 function cleanList(value, allowed, maximum = 12) {
   if (!Array.isArray(value)) return [];
   return [...new Set(value.map(item => cleanText(item, 50)).filter(item => !allowed || allowed.includes(item)))].slice(0, maximum);
@@ -322,7 +347,9 @@ function createMatch(first, second, options = {}) {
     source: options.bookingType || 'automatic',
     listingId: options.listingId || null,
     scheduledStart: options.sharedSlot,
-    mediaProvider: DAILY_API_KEY ? 'daily' : 'webrtc',
+    mediaProvider: 'external',
+    meetingProvider: null,
+    meetingUrl: null,
     sessionMode: 'directed',
     durationMinutes: 45,
     status: 'matched',
@@ -393,6 +420,7 @@ function publicPeer(profile) {
   return { name: profile.name, languages: profile.languages, experience: profile.experience, spokenLanguage: profile.spokenLanguage, practiceMode: practiceMode(profile), sessionsCompleted: profile.stats?.sessionsCompleted || 0 };
 }
 function publicMatch(match, email, now = Date.now()) {
+  if (!isParticipant(match, email)) return null;
   const peer = match.people.find(person => person.email !== email);
   return {
     roomId: match.id,
@@ -407,7 +435,9 @@ function publicMatch(match, email, now = Date.now()) {
     source: match.source || match.bookingType || 'automatic',
     listingId: match.listingId || null,
     scheduledStart: match.scheduledStart || match.sharedSlot,
-    videoProvider: match.mediaProvider || 'webrtc',
+    videoProvider: match.mediaProvider || 'external',
+    meetingProvider: match.meetingProvider || null,
+    meetingUrl: match.meetingUrl || null,
     ...joinWindow(match, now),
     status: match.status,
     selfFeedback: feedbackWithCriteria(match, email),
@@ -771,6 +801,33 @@ io.on('connection', socket => {
     acknowledge(callback, { ok: true, cancelledRoomId: roomId, ...scheduleStateFor(email) });
   });
 
+  socket.on('set-meeting-link', (packet, callback) => {
+    const roomId = cleanText(packet?.roomId, 100);
+    const match = authorizedMatch(socket, roomId);
+    if (!match || !['matched', 'in_progress'].includes(match.status)) return reject(socket, callback, 'This interview is no longer available.');
+    if (match.mediaProvider !== 'external') return reject(socket, callback, 'This existing call cannot be changed while it is using the legacy video service.');
+    const person = match.people.find(participant => participant.email === email);
+    if (practiceMode(person) !== 'interviewer') return reject(socket, callback, 'Only the interviewer can add or change the meeting link.');
+    const details = meetingLinkDetails(packet?.meetingUrl);
+    if (details.error) return reject(socket, callback, details.error);
+    const firstLink = !match.meetingUrl;
+    const changed = match.meetingUrl !== details.meetingUrl;
+    match.mediaProvider = 'external';
+    match.meetingProvider = details.meetingProvider;
+    match.meetingUrl = details.meetingUrl;
+    match.meetingUpdatedAt = new Date().toISOString();
+    save();
+    acknowledge(callback, { ok: true, match: publicMatch(match, email), ...scheduleStateFor(email) });
+    match.people.forEach(participant => {
+      emitToEmail(participant.email, 'meeting-link-updated', publicMatch(match, participant.email));
+      emitScheduleState(participant.email);
+    });
+    if (changed && firstLink) {
+      const peer = match.people.find(participant => participant.email !== email);
+      notify(peer, 'Your interview link is ready', `The interviewer added a ${details.meetingProvider === 'teams' ? 'Microsoft Teams' : 'Zoom'} link for your ${match.interviewType} session.`, match.id);
+    }
+  });
+
   socket.on('prepare-call', async (packet, callback) => {
     const roomId = cleanText(typeof packet === 'object' ? packet?.roomId : packet, 100);
     const match = authorizedMatch(socket, roomId);
@@ -779,6 +836,7 @@ io.on('connection', socket => {
     if (busyParticipant) return reject(socket, callback, busyParticipant.email === email ? 'Finish your current live interview before joining another room.' : 'Your interview partner is still in another live interview. Please wait and retry.');
     const window = joinWindow(match);
     if (!window.canJoinNow) return reject(socket, callback, `This room opens 10 minutes before the scheduled session.`, { code: 'TOO_EARLY', ...window });
+    if (match.mediaProvider === 'external') return acknowledge(callback, { ok: true, provider: 'external', meetingProvider: match.meetingProvider || null, meetingUrl: match.meetingUrl || null, ...window });
     if (match.mediaProvider !== 'daily') return acknowledge(callback, { ok: true, provider: 'webrtc', ...window });
     if (!DAILY_API_KEY) return reject(socket, callback, 'Hosted video is not configured for this session. Contact support or reschedule.', { code: 'DAILY_NOT_CONFIGURED' });
     try {
@@ -903,7 +961,7 @@ io.on('connection', socket => {
   socket.on('disconnect', () => removeOnline(email, socket.id));
 });
 
-app.get('/health', (_, response) => response.status(200).json({ status: 'ok', persistence: SUPABASE_SECRET_KEY ? 'supabase' : 'local', video: DAILY_API_KEY ? 'daily-ready' : 'webrtc-fallback' }));
+app.get('/health', (_, response) => response.status(200).json({ status: 'ok', persistence: SUPABASE_SECRET_KEY ? 'supabase' : 'local', video: 'external-meeting-links' }));
 const publicAssets = new Set(['index.html', 'styles.css', 'call.css', 'features.css', 'design.css', 'app.js', 'auth.js', 'supabase.js', 'runtime-config.js', 'site-config.js', 'runner.html', 'runner.js']);
 app.get('*', (request, response) => {
   const asset = request.path === '/' ? 'index.html' : request.path.slice(1);
@@ -920,4 +978,4 @@ async function start() {
 }
 
 if (require.main === module) start();
-module.exports = { app, server, compatibility, sharedSlots, sharedSkills, questionFor, publicMatch, historyFor, normalizedWebOrigin };
+module.exports = { app, server, compatibility, sharedSlots, sharedSkills, questionFor, publicMatch, historyFor, normalizedWebOrigin, meetingLinkDetails };

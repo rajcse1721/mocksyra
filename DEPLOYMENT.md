@@ -1,6 +1,6 @@
 # Mocksyra free deployment
 
-Mocksyra uses Netlify for the static frontend, Render for the Socket.IO/WebRTC signaling server, and Supabase for login and durable state. All three can start on their free plans.
+Mocksyra uses Netlify for the static frontend, Render for the realtime schedule and shared workspace, and Supabase for login and durable state. Video calls open through an interviewer-provided Microsoft Teams or Zoom link, so no video API key is required. All three application services can start on their free plans.
 
 ## Updating an existing deployment
 
@@ -16,16 +16,16 @@ Deploy the backend before the frontend so the new schedule UI always talks to a 
 
 2. Run the complete current `supabase-schema.sql` file. It is safe to run again.
 3. Temporarily lock or pause Netlify production publishing, then commit and push this version to the connected branch. This prevents Netlify from publishing the new frontend before Render is ready.
-4. In Render, confirm `FRONTEND_ORIGIN`, `APP_URL`, `SUPABASE_SECRET_KEY`, and (for hosted video) `DAILY_API_KEY`, then deploy the latest commit. `FRONTEND_ORIGIN` must be `https://mocksyra.netlify.app` without a trailing slash.
+4. In Render, confirm `FRONTEND_ORIGIN`, `APP_URL`, and `SUPABASE_SECRET_KEY`, then deploy the latest commit. `FRONTEND_ORIGIN` must be `https://mocksyra.netlify.app` without a trailing slash. `DAILY_API_KEY` is no longer required and can be removed after any already-running legacy interview has finished.
 5. Open `https://YOUR-RENDER-SERVICE.onrender.com/health`. For the intended hosted setup it should report all three values:
 
    ```json
-   { "status": "ok", "persistence": "supabase", "video": "daily-ready" }
+   { "status": "ok", "persistence": "supabase", "video": "external-meeting-links" }
    ```
 
    Also check the Render logs. Do not continue if you see `Using local persistence` or `Supabase persistence failed`.
 6. Unlock production publishing and deploy the latest commit in Netlify. Confirm that `runtime-config.js` still contains the Render HTTPS URL.
-7. Sign out and back in once. Use two different accounts in separate browsers or incognito profiles to test Google login, publishing two different dates, cancelling only one offer, booking a newly created session, and opening the exact booking from **Your schedule** on desktop and mobile.
+7. Sign out and back in once. Use two different accounts in separate browsers or incognito profiles to test Google login, publishing two different dates, cancelling only one offer, and booking a newly created session. From the interviewer account, paste a Teams or Zoom participant link. Confirm that the candidate sees the same link, that it opens in a new tab, and that the shared workspace remains connected on desktop and mobile.
 
 The first backend start automatically migrates each future legacy availability time into an independent offer. Existing completed history is kept. Open offers and upcoming interviews are limited to four per account; cancelling one does not remove the others.
 
@@ -72,13 +72,12 @@ Use the Supabase callback only as Google’s redirect URI. Use the Netlify origi
    - `FRONTEND_ORIGIN`: every exact frontend origin users will open, such as `https://mocksyra.netlify.app` (no trailing slash). Separate multiple origins with commas.
    - `APP_URL`: the same Netlify origin.
    - `SUPABASE_SECRET_KEY`: the `sb_secret_...` key copied directly from the same Supabase project configured in `supabase.js`.
-   - `DAILY_API_KEY`: your Daily API key when hosted video is enabled.
 4. Keep the service on the Free plan and deploy.
 5. Copy the Render HTTPS URL, such as `https://mocksyra-realtime.onrender.com`.
 
 When an existing backend starts with this version, legacy Peer Practice listings are removed and unfinished legacy peer sessions are closed. Completed history remains available.
 
-Render's free web service can sleep after inactivity, so the first connection can take roughly a minute to wake. Active Socket.IO traffic keeps a running interview backend awake, and Daily carries the call media after admission.
+Render's free web service can sleep after inactivity, so the first connection can take roughly a minute to wake. Active Socket.IO traffic keeps the schedule and shared interview workspace connected. Zoom or Teams carries the camera and microphone traffic separately.
 
 If the Netlify site does not exist yet, initially use its temporary/future name, then correct `FRONTEND_ORIGIN` and `APP_URL` in Render after Netlify assigns the final URL.
 
@@ -107,13 +106,13 @@ To enable email, create these secret environment variables manually in Render:
 
 Do not add either value to repository files. Redeploy the Render service after setting them.
 
-## 5. Hosted Daily video
+## 5. Zoom and Microsoft Teams meetings
 
-Mocksyra automatically uses Daily Prebuilt for newly booked sessions when `DAILY_API_KEY` is configured. Create an API key in the Daily dashboard, add it to Render as a secret environment variable named `DAILY_API_KEY`, and redeploy the backend. Never add this key to Netlify, `runtime-config.js`, Git, screenshots, or client-side code.
+After an interview is booked, the interviewer opens the booking, creates a meeting in Zoom or Microsoft Teams, and pastes the participant join link into Mocksyra. The server accepts only secure links on official Zoom and Teams domains. The candidate cannot edit the link, and it never appears on the public sessions board.
 
-The backend creates private two-person rooms only when an authenticated participant enters the join window. Rooms and participant tokens expire automatically. Existing matches keep the video provider selected when they were created; local development without a Daily key uses the direct WebRTC fallback.
+Microsoft Teams Free is the recommended option for a 45-minute Mocksyra interview because its free meeting limit is 60 minutes. Zoom Basic is also supported, but its free meetings normally end after 40 minutes. Mocksyra intentionally does not create meetings automatically: Teams Free personal accounts do not support Graph-based meeting creation, while Zoom automation would require an additional Zoom authorization flow and would still keep the Basic plan's duration and concurrency limits.
 
-Create a new booking after adding `DAILY_API_KEY` when testing. A room opens 10 minutes before its scheduled start; join it from two different accounts and confirm camera and microphone permissions in both browsers.
+At interview time, each participant selects **Join Zoom** or **Join Microsoft Teams**. The call opens in a new tab; keep Mocksyra open in the original tab for the timer, question, shared workspace, and feedback. Camera and microphone permissions are handled by Zoom or Teams rather than by Mocksyra.
 
 ## Local development
 

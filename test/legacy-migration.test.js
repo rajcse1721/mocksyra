@@ -96,6 +96,28 @@ test('real startup migrates legacy waiting state without losing completed histor
           { email: 'legacy@example.test', name: 'Legacy User', practiceMode: 'peer' },
           { email: 'other@example.test', name: 'Other User', practiceMode: 'candidate' }
         ]
+      },
+      'future-daily-room': {
+        id: 'future-daily-room',
+        status: 'matched',
+        sharedSlot: futureSlots[1],
+        mediaProvider: 'daily',
+        dailyRoom: { name: 'legacy-room', url: 'https://legacy.daily.test/room' },
+        people: [
+          { email: 'candidate@example.test', name: 'Candidate', practiceMode: 'candidate' },
+          { email: 'interviewer@example.test', name: 'Interviewer', practiceMode: 'interviewer' }
+        ]
+      },
+      'live-daily-room': {
+        id: 'live-daily-room',
+        status: 'in_progress',
+        sharedSlot: isoHoursFromNow(-0.1),
+        sessionStartedAt: new Date().toISOString(),
+        mediaProvider: 'daily',
+        people: [
+          { email: 'live-candidate@example.test', name: 'Live Candidate', practiceMode: 'candidate' },
+          { email: 'live-interviewer@example.test', name: 'Live Interviewer', practiceMode: 'interviewer' }
+        ]
       }
     },
     notifications: [{ id: 'preserved-notification', email: 'legacy@example.test' }]
@@ -138,5 +160,9 @@ test('real startup migrates legacy waiting state without losing completed histor
   assert.deepEqual(migrated.matches[completedMatch.id], completedMatch, 'completed interview history is unchanged');
   assert.equal(migrated.matches['active-peer-room'].status, 'expired', 'an unfinished legacy peer session cannot be reopened');
   assert.ok(Number.isFinite(Date.parse(migrated.matches['active-peer-room'].expiredAt)));
+  assert.equal(migrated.matches['future-daily-room'].mediaProvider, 'external', 'future embedded-video bookings move to external meeting links');
+  assert.equal(migrated.matches['future-daily-room'].meetingUrl, null);
+  assert.equal(Object.hasOwn(migrated.matches['future-daily-room'], 'dailyRoom'), false, 'unused hosted-room details are removed');
+  assert.equal(migrated.matches['live-daily-room'].mediaProvider, 'daily', 'a call already in progress is not interrupted during the transition release');
   assert.deepEqual(migrated.notifications, legacyState.notifications, 'unrelated persisted account data is retained');
 });

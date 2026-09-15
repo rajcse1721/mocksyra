@@ -16,5 +16,3 @@ services:
         sync: false
       - key: SUPABASE_SECRET_KEY
         sync: false
-      - key: DAILY_API_KEY
-        sync: false

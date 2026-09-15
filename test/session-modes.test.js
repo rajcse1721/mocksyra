@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { compatibility, publicMatch, historyFor, app, normalizedWebOrigin } = require('../server');
+const { compatibility, publicMatch, historyFor, app, normalizedWebOrigin, meetingLinkDetails } = require('../server');
 const { compatibleModes, sessionDetails, currentQuestion, canUseRoom, validFeedback, finishFeedback } = require('../session-rules');
 
 const first = { email: 'candidate@example.test', name: 'Ada', languages: ['JavaScript'], slots: ['2030-01-01T10:00:00.000Z'], interviewType: 'Frontend', experience: 'Intermediate', spokenLanguage: 'English' };
@@ -23,6 +23,24 @@ test('configured browser origins are normalized for Socket.IO CORS', () => {
   assert.equal(normalizedWebOrigin(' https://mocksyra.netlify.app/ '), 'https://mocksyra.netlify.app');
   assert.equal(normalizedWebOrigin('http://localhost:3000/anything'), 'http://localhost:3000');
   assert.equal(normalizedWebOrigin('not-an-origin'), '');
+});
+
+test('only official secure Zoom and Teams participant links are accepted', () => {
+  assert.deepEqual(meetingLinkDetails('https://us06web.zoom.us/j/123456789?pwd=secret'), {
+    meetingUrl: 'https://us06web.zoom.us/j/123456789?pwd=secret', meetingProvider: 'zoom'
+  });
+  assert.equal(meetingLinkDetails('https://teams.microsoft.com/l/meetup-join/19%3ameeting_test/0?context=test').meetingProvider, 'teams');
+  assert.equal(meetingLinkDetails('https://teams.live.com/meet/123456789').meetingProvider, 'teams');
+  for (const value of [
+    'http://zoom.us/j/123',
+    'https://user:pass@zoom.us/j/123',
+    'https://zoom.us:8443/j/123',
+    'https://zoom.us.evil.test/j/123',
+    'https://example.com/zoom.us/j/123',
+    'https://zoom.us/pricing',
+    'https://teams.microsoft.com/download'
+  ]) assert.ok(meetingLinkDetails(value).error, value);
+  assert.ok(meetingLinkDetails(`https://zoom.us/j/${'1'.repeat(2050)}`).error, 'oversized links are rejected');
 });
 
 test('only candidate and interviewer are complementary roles', () => {
@@ -90,6 +108,18 @@ test('match without question or feedback records still restores safely', () => {
   assert.equal(result.selfFeedback, null);
   assert.ok(result.question.prompt);
   assert.ok(result.question.hints.length);
+});
+
+test('meeting details are private to match participants', () => {
+  const match = interview('directed');
+  match.mediaProvider = 'external';
+  match.meetingProvider = 'teams';
+  match.meetingUrl = 'https://teams.live.com/meet/123456789';
+  const participant = publicMatch(match, first.email);
+  assert.equal(participant.videoProvider, 'external');
+  assert.equal(participant.meetingProvider, 'teams');
+  assert.equal(participant.meetingUrl, match.meetingUrl);
+  assert.equal(publicMatch(match, 'outsider@example.test'), null);
 });
 
 test('scheduled rooms open ten minutes early without leaking hosted-video credentials', () => {

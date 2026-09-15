@@ -91,6 +91,18 @@ const authUserKey = user => user?.email ? `${user.id || 'email'}:${String(user.e
 const bookingDisplayName = () => state.profile?.name || accountIdentity().name;
 const modeFor = () => modes[normalizedMode(state.match?.practiceMode || state.profile?.practiceMode)];
 const sessionMinutes = () => Number(state.match?.durationMinutes) || 45;
+const meetingDetailsFor = matchData => {
+  try {
+    const url = new URL(String(matchData?.meetingUrl || ''));
+    const host = url.hostname.toLowerCase();
+    const zoom = host === 'zoom.us' || host.endsWith('.zoom.us');
+    const teams = host === 'teams.microsoft.com' || host === 'teams.live.com';
+    if (url.protocol !== 'https:' || url.username || url.password || url.port || (!zoom && !teams)) return null;
+    if (zoom && !/^\/(?:j|my)\//i.test(url.pathname)) return null;
+    if (teams && !/^\/(?:l\/meetup-join|meet)\//i.test(url.pathname)) return null;
+    return { url: url.href, provider: zoom ? 'zoom' : 'teams', label: zoom ? 'Zoom' : 'Microsoft Teams', mark: zoom ? 'Z' : 'T' };
+  } catch { return null; }
+};
 const closedMatch = match => !match || ['completed', 'cancelled', 'expired'].includes(match.status);
 if (state.match && !closedMatch(state.match) && !state.activeMatches.some(item => item.roomId === state.match.roomId)) {
   state.activeMatches.push(state.match);
@@ -100,7 +112,8 @@ const confirmedMatches = () => state.activeMatches.filter(matchData => !closedMa
 const persistMatches = () => localStorage.setItem(ACTIVE_MATCHES_KEY, JSON.stringify(state.activeMatches));
 const selectMatch = matchData => {
   if (!matchData) return;
-  if (state.roomId !== matchData.roomId) {
+  const providerChanged = state.roomId === matchData.roomId && state.match?.videoProvider && state.match.videoProvider !== matchData.videoProvider;
+  if (state.roomId !== matchData.roomId || providerChanged) {
     endLocalCall();
     state.workspace = { code: '', language: matchData.peer?.languages?.[0] || 'JavaScript', version: 0 };
     state.chat = [];
@@ -571,7 +584,9 @@ function renderYourSchedule() {
   upcoming.innerHTML = matches.length ? matches.map(matchData => {
     const role = modes[normalizedMode(matchData.practiceMode)].title;
     const joinState = scheduledJoinState(matchData);
-    const action = matchData.status === 'feedback_pending' ? 'Complete feedback' : joinState.allowed ? 'Join now' : 'View booking';
+    const meeting = meetingDetailsFor(matchData);
+    const externalSession = matchData.videoProvider === 'external';
+    const action = matchData.status === 'feedback_pending' ? 'Complete feedback' : externalSession && !meeting ? (matchData.practiceMode === 'interviewer' ? 'Add meeting link' : 'Waiting for link') : joinState.allowed ? (externalSession ? `Join ${meeting.label}` : 'Join now') : 'View booking';
     return `<article class="schedule-card" data-room-id="${escapeHtml(matchData.roomId)}">
       <div class="schedule-card-main"><div class="schedule-card-copy"><span class="match-badge">${escapeHtml(role)}</span><h3>${escapeHtml(matchData.interviewType)} with ${escapeHtml(matchData.peer?.name || 'your partner')}</h3><p>${escapeHtml((matchData.languages || []).join(' · ') || matchData.peer?.languages?.join(' · ') || 'Interview session')}</p></div><div class="schedule-card-meta"><time datetime="${escapeHtml(matchData.sharedSlot)}">${escapeHtml(formatSlot(matchData.sharedSlot))}</time><span>${Number(matchData.durationMinutes) || 45} minutes</span></div></div>
       <div class="schedule-card-actions"><button class="button" data-open-match="${escapeHtml(matchData.roomId)}">${action}</button>${matchData.status === 'matched' ? `<button class="text-button" data-cancel-match="${escapeHtml(matchData.roomId)}">Cancel interview</button>` : ''}</div>
@@ -702,20 +717,48 @@ function match() {
   const feedbackPending = state.match.status === 'feedback_pending';
   const joinState = scheduledJoinState(state.match);
   const partnerRole = state.match.peerRole === 'candidate' ? 'Candidate' : 'Interviewer';
+  const externalSession = state.match.videoProvider === 'external';
+  const interviewer = state.match.practiceMode === 'interviewer';
+  const meeting = meetingDetailsFor(state.match);
+  const meetingPanel = !externalSession ? '' : interviewer ? `<section class="meeting-link-panel" aria-labelledby="meeting-link-title">
+      <div class="meeting-link-heading"><span class="meeting-provider-mark ${meeting?.provider || 'empty'}" aria-hidden="true">${meeting ? meeting.mark : '↗'}</span><div><h3 id="meeting-link-title">${meeting ? `${escapeHtml(meeting.label)} meeting ready` : 'Add the video meeting'}</h3><p>Create the meeting in Zoom or Teams, then paste its participant join link.</p></div></div>
+      <form class="meeting-link-form" id="meeting-link-form">
+        <label class="field-label" for="meeting-url">Zoom or Microsoft Teams link</label>
+        <div class="meeting-link-row"><input class="textarea input meeting-url-input" id="meeting-url" name="meeting-url" type="url" inputmode="url" autocomplete="url" maxlength="2048" required value="${escapeHtml(meeting?.url || '')}" placeholder="https://teams.microsoft.com/l/meetup-join/…"><button class="button secondary" id="save-meeting-link" type="submit">${meeting ? 'Update link' : 'Save link'}</button></div>
+        <p class="meeting-link-error" id="meeting-link-error" role="alert"></p>
+        <small class="meeting-note">Teams Free supports this 45-minute session. Zoom Basic normally ends after 40 minutes.</small>
+      </form>
+    </section>` : meeting ? `<section class="meeting-link-status ready" role="status"><span class="meeting-provider-mark ${meeting.provider}" aria-hidden="true">${meeting.mark}</span><div><b>${escapeHtml(meeting.label)} meeting ready</b><p>The meeting opens in a new tab. Keep Mocksyra open for the shared workspace.</p></div></section>` : `<section class="meeting-link-status waiting" role="status" aria-live="polite"><span class="meeting-provider-mark empty" aria-hidden="true">…</span><div><b>Waiting for the meeting link</b><p>The interviewer will add a Zoom or Microsoft Teams link here.</p></div></section>`;
+  const joinCopy = feedbackPending ? 'Continue to feedback' : !externalSession ? (joinState.allowed ? 'Join interview' : 'Room not open yet') : !meeting ? (interviewer ? 'Save a meeting link first' : 'Waiting for interviewer') : joinState.allowed ? `Join ${meeting.label}` : 'Meeting not open yet';
+  const joinControl = feedbackPending ? `<button class="button" id="join">${joinCopy}</button>` : externalSession ? (meeting && joinState.allowed ? `<a class="button" id="join" href="${escapeHtml(meeting.url)}" target="_blank" rel="noopener noreferrer">${joinCopy}</a>` : `<button class="button" id="join" disabled>${joinCopy}</button>`) : `<button class="button" id="join"${joinState.allowed ? '' : ' disabled'}>${joinCopy}</button>`;
   root.innerHTML = frame(`<section class="simple-page booking-page">
-    <header class="simple-page-heading"><h1 class="page-title">Your interview</h1><p class="page-subtitle">The private room opens shortly before the scheduled time.</p></header>
+    <header class="simple-page-heading"><h1 class="page-title">Your interview</h1><p class="page-subtitle">${externalSession ? 'Your meeting and shared workspace open shortly before the scheduled time.' : 'The private room opens shortly before the scheduled time.'}</p></header>
     <article class="booking-card">
       <div class="booking-partner"><span class="listing-avatar">${escapeHtml(peer.name?.[0] || '?')}</span><div><small>${partnerRole}</small><h2>${escapeHtml(peer.name)}</h2><p>${escapeHtml(peer.experience)}</p></div></div>
       <dl class="booking-details"><div><dt>Your role</dt><dd>${escapeHtml(modeFor().title)}</dd></div><div><dt>Interview</dt><dd>${escapeHtml(state.match.interviewType)}</dd></div><div><dt>When</dt><dd>${escapeHtml(formatSlot(state.match.sharedSlot))}</dd></div><div><dt>Duration</dt><dd>${sessionMinutes()} minutes</dd></div></dl>
-      <p class="join-status" id="join-status">${feedbackPending ? 'Complete your feedback to finish this interview.' : escapeHtml(joinState.message)}</p>
-      <div class="booking-actions"><button class="button secondary" id="test-devices">Test camera & mic</button><button class="button secondary" id="calendar">Add to calendar</button><button class="button" id="join" ${!feedbackPending && !joinState.allowed ? 'disabled' : ''}>${feedbackPending ? 'Continue to feedback' : joinState.allowed ? 'Join interview' : 'Room not open yet'}</button></div>
-      <div class="device-check-inline"><video id="device-preview" autoplay muted playsinline hidden></video><p class="device-status" id="device-status">Camera and microphone not tested</p></div>
+      ${meetingPanel}
+      <p class="join-status" id="join-status">${feedbackPending ? 'Complete your feedback to finish this interview.' : externalSession && !meeting ? (interviewer ? 'Add the meeting link so both participants can join.' : 'You will be able to join as soon as the interviewer adds the link.') : escapeHtml(joinState.message)}</p>
+      <div class="booking-actions">${externalSession ? '' : '<button class="button secondary" id="test-devices">Test camera & mic</button>'}<button class="button secondary" id="calendar">Add to calendar</button>${joinControl}</div>
+      ${externalSession ? '' : '<div class="device-check-inline"><video id="device-preview" autoplay muted playsinline hidden></video><p class="device-status" id="device-status">Camera and microphone not tested</p></div>'}
     </article>
     ${state.match.status === 'matched' ? '<button class="text-button cancel-match" id="cancel-match">Cancel interview</button>' : ''}
   </section>`);
   bindRoutes();
-  root.querySelector('#test-devices').onclick = deviceCheck;
+  if (!externalSession) root.querySelector('#test-devices').onclick = deviceCheck;
   root.querySelector('#calendar').onclick = downloadCalendar;
+  root.querySelector('#meeting-link-form')?.addEventListener('submit', async event => {
+    event.preventDefault();
+    const input = root.querySelector('#meeting-url'), button = root.querySelector('#save-meeting-link'), error = root.querySelector('#meeting-link-error');
+    button.disabled = true; button.textContent = 'Saving…'; error.textContent = '';
+    const response = await request('set-meeting-link', { roomId: state.roomId, meetingUrl: input.value });
+    if (!response.ok) {
+      button.disabled = false; button.textContent = meeting ? 'Update link' : 'Save link'; error.textContent = response.error; input.focus(); return;
+    }
+    applyScheduleResponse(response);
+    if (response.match) { upsertMatch(response.match); selectMatch(response.match); }
+    toast('Meeting link saved for both participants.');
+    match();
+  });
   root.querySelector('#cancel-match')?.addEventListener('click', async () => {
     if (!confirm('Cancel this match for both participants?')) return;
     const result = await request('cancel-match', state.roomId);
@@ -724,6 +767,12 @@ function match() {
   });
   root.querySelector('#join').onclick = async () => {
     if (feedbackPending) return go('feedback');
+    if (externalSession) {
+      if (!meeting || !joinState.allowed) return;
+      const selectedRoomId = state.roomId;
+      setTimeout(() => { if (state.roomId === selectedRoomId) go('session'); }, 0);
+      return;
+    }
     const roomId = state.roomId, matchData = state.match, generation = state.callGeneration;
     const isCurrent = () => routeName() === 'match' && state.roomId === roomId && state.match === matchData && state.callGeneration === generation;
     if (!(await connectSocket())) return;
@@ -738,6 +787,11 @@ function match() {
   if (!feedbackPending) state.joinClock = setInterval(() => {
     const next = scheduledJoinState(state.match), button = root.querySelector('#join'), status = root.querySelector('#join-status');
     if (!button || !status) return clearInterval(state.joinClock);
+    if (externalSession) {
+      if (next.allowed !== joinState.allowed) return match();
+      status.textContent = meeting ? next.message : interviewer ? 'Add the meeting link so both participants can join.' : 'You will be able to join as soon as the interviewer adds the link.';
+      return;
+    }
     button.disabled = !next.allowed; button.textContent = next.allowed ? 'Join interview' : 'Room not open yet'; status.textContent = next.message;
   }, 30_000);
 }
@@ -761,7 +815,56 @@ function downloadCalendar() {
   link.href = URL.createObjectURL(new Blob([body], { type: 'text/calendar' })); link.download = 'mocksyra-interview.ics'; link.click(); URL.revokeObjectURL(link.href);
 }
 
+function workspaceMarkup(question, hidden = false) {
+  return `<div class="workspace-card tool-panel" id="workspace-panel"${hidden ? ' hidden' : ''}><div class="workspace-head"><div><span class="eyebrow">LIVE SHARED PAD</span><h2 id="question-title">${escapeHtml(question.title || 'Collaborative workspace')}</h2></div><select id="code-language" class="select compact">${['JavaScript', 'TypeScript', 'Python', 'Java', 'C++', 'SQL', 'Plain text'].map(value => `<option ${value === state.workspace.language ? 'selected' : ''}>${value}</option>`).join('')}</select></div>
+    <div class="question-box" id="question-brief"><b>Interview question</b><p>${escapeHtml(question.prompt || 'Use the shared pad to work through your interview question.')}</p>${question.hints?.length ? `<details><summary>Hints for the interviewer</summary><ul>${question.hints.map(hint => `<li>${escapeHtml(hint)}</li>`).join('')}</ul></details>` : ''}</div>
+    <textarea id="shared-code" class="code-editor" spellcheck="false">${escapeHtml(state.workspace.code || question.starter || '')}</textarea>
+    <div class="workspace-actions"><span id="sync-status">Connecting the shared workspace…</span><button class="button secondary" id="copy-code">Copy</button><button class="button" id="run-code">Run JavaScript</button></div><pre id="code-output" class="code-output">Output will appear here.</pre></div>`;
+}
+
+async function prepareExternalSession() {
+  const roomId = state.roomId, generation = state.callGeneration;
+  const status = root.querySelector('#external-session-status');
+  const isCurrent = () => state.roomId === roomId && state.callGeneration === generation && routeName() === 'session';
+  if (!(await connectSocket())) {
+    if (isCurrent()) { status.textContent = 'Could not connect the shared workspace. Return to your booking and retry.'; status.classList.add('error'); }
+    return;
+  }
+  if (!isCurrent()) return;
+  const joined = await joinCurrentCallRoom(roomId, generation);
+  if (!isCurrent()) return;
+  if (!joined.ok) {
+    toast(joined.error || 'This interview is not available yet.');
+    return go('match');
+  }
+  status.textContent = 'Shared workspace connected. Keep this tab open during the call.';
+  status.classList.add('ready');
+  if (joined.startedAt) startSyncedTimer(joined.startedAt);
+  socket.emit('workspace-request', roomId);
+}
+
+function externalSession() {
+  const meeting = meetingDetailsFor(state.match);
+  if (!state.match || !meeting) return go('match');
+  const roomId = state.roomId, peer = state.match.peer, question = state.match.question || {};
+  const initialTimer = `${sessionMinutes()}:00`;
+  root.innerHTML = frame(`<section class="simple-page live-session-page external-session-page">
+    <header class="simple-session-heading"><div><p class="eyebrow">LIVE INTERVIEW</p><h1 class="page-title">${escapeHtml(state.match.interviewType)}</h1><p class="page-subtitle">You are the ${escapeHtml(modeFor().title.toLowerCase())} · with ${escapeHtml(peer.name)}</p></div><div class="simple-timer" id="side-timer">${initialTimer}</div></header>
+    <section class="external-meeting-card" aria-labelledby="external-meeting-title">
+      <span class="meeting-provider-mark ${meeting.provider}" aria-hidden="true">${meeting.mark}</span>
+      <div class="external-meeting-copy"><p class="eyebrow">VIDEO CALL</p><h2 id="external-meeting-title">Use ${escapeHtml(meeting.label)} for the conversation</h2><p id="external-session-status" role="status" aria-live="polite">Connecting the shared workspace…</p></div>
+      <div class="external-meeting-actions"><a class="button secondary" href="${escapeHtml(meeting.url)}" target="_blank" rel="noopener noreferrer">Open ${escapeHtml(meeting.label)} again</a><button class="button finish-interview" id="complete"><span>Finish interview</span></button></div>
+    </section>
+    <section class="session-main">${workspaceMarkup(question)}</section>
+  </section>`);
+  bindRoutes();
+  bindWorkspace();
+  prepareExternalSession();
+  root.querySelector('#complete').onclick = event => { if (confirm('Finish the interview for both participants and open feedback?')) finishCurrentSession(roomId, event.currentTarget); };
+}
+
 function session() {
+  if (state.match?.videoProvider === 'external') return externalSession();
   const dailySession = state.match?.videoProvider === 'daily';
   if (!state.match || (!dailySession && !state.stream?.active)) return go('match');
   const roomId = state.roomId;
@@ -776,10 +879,7 @@ function session() {
     <div class="session-tools"><button class="tool-tab selected" data-tab="video-panel">Video</button><button class="tool-tab" data-tab="workspace-panel">Workspace</button></div>
     <section class="session-main">
       ${videoSurface}
-      <div class="workspace-card tool-panel" id="workspace-panel" hidden><div class="workspace-head"><div><span class="eyebrow">LIVE SHARED PAD</span><h2 id="question-title">${escapeHtml(question.title || 'Collaborative workspace')}</h2></div><select id="code-language" class="select compact">${['JavaScript', 'TypeScript', 'Python', 'Java', 'C++', 'SQL', 'Plain text'].map(value => `<option ${value === state.workspace.language ? 'selected' : ''}>${value}</option>`).join('')}</select></div>
-        <div class="question-box" id="question-brief"><b>Interview question</b><p>${escapeHtml(question.prompt || 'Use the shared pad to work through your interview question.')}</p>${question.hints?.length ? `<details><summary>Hints for the interviewer</summary><ul>${question.hints.map(hint => `<li>${escapeHtml(hint)}</li>`).join('')}</ul></details>` : ''}</div>
-        <textarea id="shared-code" class="code-editor" spellcheck="false">${escapeHtml(state.workspace.code || question.starter || '')}</textarea>
-        <div class="workspace-actions"><span id="sync-status">Synced with your partner</span><button class="button secondary" id="copy-code">Copy</button><button class="button" id="run-code">Run JavaScript</button></div><pre id="code-output" class="code-output">Output will appear here.</pre></div>
+      ${workspaceMarkup(question, true)}
     </section></section>`);
   bindRoutes();
   if (!dailySession) root.querySelector('#local').srcObject = state.stream;
@@ -824,6 +924,23 @@ async function disposeDailyCall(call, timeoutMs = 1200) {
   }
 }
 
+let dailySdkPromise;
+function loadDailySdk() {
+  if (window.DailyIframe) return Promise.resolve(true);
+  if (dailySdkPromise) return dailySdkPromise;
+  const task = new Promise(resolve => {
+    const script = document.createElement('script');
+    script.src = 'https://unpkg.com/@daily-co/daily-js@0.92.2';
+    script.crossOrigin = 'anonymous';
+    script.onload = () => resolve(Boolean(window.DailyIframe));
+    script.onerror = () => resolve(false);
+    document.head.append(script);
+  });
+  dailySdkPromise = task;
+  task.then(loaded => { if (!loaded && dailySdkPromise === task) dailySdkPromise = null; });
+  return task;
+}
+
 function setDailyStatus(status, message, tone = '') {
   if (!status) return;
   status.className = `daily-status${tone ? ` ${tone}` : ''}`;
@@ -845,7 +962,12 @@ async function prepareDailyCall() {
     if (socket.connected) socket.emit('leave-session', roomId);
   };
   let failed = false;
-  if (!window.DailyIframe) { setDailyStatus(status, 'The hosted video component could not load. Check your connection and refresh.', 'error'); return; }
+  if (!window.DailyIframe) {
+    setDailyStatus(status, 'Loading the legacy hosted video component…');
+    const loaded = await loadDailySdk();
+    if (!isCurrent()) return;
+    if (!loaded) { setDailyStatus(status, 'The hosted video component could not load. Check your connection and refresh.', 'error'); return; }
+  }
   const showRetry = message => {
     if (!isCurrent()) return;
     failed = true;
@@ -1209,10 +1331,11 @@ async function restoreLiveRoomAfterReconnect() {
   const connectionId = socket.id;
   const daily = state.dailyCall;
   const pc = state.pc;
-  if (!roomId || roomId !== state.roomId || routeName() !== 'session' || (!daily && !pc)) return;
+  const external = state.match?.videoProvider === 'external';
+  if (!roomId || roomId !== state.roomId || routeName() !== 'session' || (!daily && !pc && !external)) return;
   if (pc) state.offerStarted = false;
   const joined = await joinCurrentCallRoom(roomId, generation);
-  const stillCurrent = socket.connected && socket.id === connectionId && state.roomId === roomId && state.liveRoomId === roomId && state.callGeneration === generation && routeName() === 'session' && (daily ? state.dailyCall === daily : state.pc === pc);
+  const stillCurrent = socket.connected && socket.id === connectionId && state.roomId === roomId && state.liveRoomId === roomId && state.callGeneration === generation && routeName() === 'session' && (external ? state.match?.videoProvider === 'external' : daily ? state.dailyCall === daily : state.pc === pc);
   if (!stillCurrent) return;
   if (!joined.ok) {
     toast(joined.error || 'Your live interview could not reconnect. Please rejoin.');
@@ -1245,6 +1368,15 @@ socket.on('match-cancelled', packet => {
   if (location.hash === '#marketplace') { renderYourSchedule(); refreshMarketplace(false); }
   else if (cancelledSelected && !['#home', '#auth'].includes(location.hash)) go('marketplace');
 });
+socket.on('meeting-link-updated', matchData => {
+  if (!matchData?.roomId) return;
+  upsertMatch(matchData);
+  if (state.roomId === matchData.roomId) {
+    selectMatch(matchData);
+    if (routeName() === 'match') match();
+    else if (routeName() === 'session' && matchData.videoProvider === 'external') externalSession();
+  } else if (location.hash === '#marketplace') renderYourSchedule();
+});
 socket.on('profile-state', restored => {
   const currentEmail = String(state.authUser?.email || '').toLowerCase();
   const restoredEmail = String(restored?.profile?.email || '').toLowerCase();
@@ -1256,6 +1388,7 @@ socket.on('profile-state', restored => {
   }
   state.restored = true;
   const hasSchedule = Array.isArray(restored?.activeMatches) || Array.isArray(restored?.upcomingMatches) || Object.hasOwn(restored || {}, 'activeMatch');
+  const selectedBeforeRestore = state.match ? [state.match.roomId, state.match.status, state.match.videoProvider, state.match.meetingProvider, state.match.meetingUrl].join('|') : '';
   applyScheduleResponse(restored);
   const refreshedSelected = state.activeMatches.find(item => item.roomId === state.roomId);
   if (refreshedSelected) selectMatch(refreshedSelected);
@@ -1277,6 +1410,8 @@ socket.on('profile-state', restored => {
     toast('That interview is no longer in your active schedule.');
     return go('marketplace');
   }
+  const selectedAfterRestore = state.match ? [state.match.roomId, state.match.status, state.match.videoProvider, state.match.meetingProvider, state.match.meetingUrl].join('|') : '';
+  if (routeName() === 'match' && refreshedSelected && selectedBeforeRestore !== selectedAfterRestore) return match();
   if (location.hash === '#marketplace' && hasSchedule) renderYourSchedule();
 });
 socket.on('schedule-updated', schedule => {
@@ -1303,6 +1438,11 @@ socket.on('session-ready', async packet => {
   if (roomId !== state.roomId) { if (location.hash === '#marketplace') renderYourSchedule(); return; }
   if (scheduled) selectMatch({ ...scheduled, status: 'in_progress', startedAt: packet.startedAt || scheduled.startedAt });
   if (packet.startedAt) startSyncedTimer(packet.startedAt);
+  if (state.match?.videoProvider === 'external') {
+    const status = root.querySelector('#external-session-status');
+    if (status) { status.textContent = 'Both participants are ready. Your 45-minute session has started.'; status.className = 'ready'; }
+    return;
+  }
   if (state.match?.videoProvider === 'daily') {
     const status = root.querySelector('#daily-status');
     if (!status?.classList.contains('error')) setDailyStatus(status, 'Both participants are here. Your session has started.', 'ready');
