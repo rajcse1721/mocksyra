@@ -1,7 +1,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { compatibility, publicMatch, historyFor, app } = require('../server');
-const { PEER_SWITCH_MS, compatibleModes, sessionDetails, currentQuestion, canUseRoom, validFeedback, finishFeedback } = require('../session-rules');
+const { compatibleModes, sessionDetails, currentQuestion, canUseRoom, validFeedback, finishFeedback } = require('../session-rules');
 
 const first = { email: 'candidate@example.test', name: 'Ada', languages: ['JavaScript'], slots: ['2030-01-01T10:00:00.000Z'], interviewType: 'Frontend', experience: 'Intermediate', spokenLanguage: 'English' };
 const second = { ...first, email: 'interviewer@example.test', name: 'Sam' };
@@ -11,25 +11,25 @@ const questions = {
   [second.email]: { title: 'Second question', prompt: 'Solve question two.', starter: '// Start two', hints: ['Private hint two'] }
 };
 
-function interview(mode = 'peer', status = 'matched') {
+function interview(mode = 'directed', status = 'matched') {
   return {
     id: 'sample-room', status,
-    people: mode === 'peer' ? [{ ...first }, { ...second }] : [{ ...first, practiceMode: 'candidate' }, { ...second, practiceMode: 'interviewer' }],
+    people: [{ ...first, practiceMode: 'candidate' }, { ...second, practiceMode: 'interviewer' }],
     questions, interviewType: 'Frontend', sharedSlot: first.slots[0], score: 80, feedback: {}
   };
 }
 
-test('all nine mode pairs allow only reciprocal peers or complementary roles', () => {
-  const allowed = new Set(['peer:peer', 'candidate:interviewer', 'interviewer:candidate']);
-  for (const a of ['peer', 'candidate', 'interviewer']) {
-    for (const b of ['peer', 'candidate', 'interviewer']) {
+test('only candidate and interviewer are complementary roles', () => {
+  const allowed = new Set(['candidate:interviewer', 'interviewer:candidate']);
+  for (const a of ['candidate', 'interviewer']) {
+    for (const b of ['candidate', 'interviewer']) {
       const expected = allowed.has(`${a}:${b}`);
       assert.equal(compatibleModes({ practiceMode: a }, { practiceMode: b }), expected, `${a} + ${b}`);
       assert.equal(Boolean(compatibility({ ...first, practiceMode: a }, { ...second, practiceMode: b })), expected);
     }
   }
-  assert.ok(compatibility(first, second), 'deployed profiles without a mode still match as peers');
-  assert.equal(compatibility(first, { ...second, practiceMode: 'candidate' }), null);
+  assert.equal(compatibility({ ...first, practiceMode: 'peer' }, { ...second, practiceMode: 'peer' }), null);
+  assert.equal(compatibility(first, { ...second, practiceMode: 'interviewer' }), null, 'new matches require an explicit role');
 });
 
 test('directed candidate may initiate WebRTC while interviewer retains the interviewer role', () => {
@@ -62,31 +62,28 @@ test('candidates see the active shared prompt without interviewer hints', () => 
   assert.equal(Object.hasOwn(questions[second.email], 'hints'), true, 'filtering never changes stored questions');
 });
 
-test('peer sessions last 45 minutes and transfer the prompt and hints halfway through', () => {
-  const match = interview('peer', 'in_progress');
+test('candidate and interviewer roles remain fixed for all 45 minutes', () => {
+  const match = interview('directed', 'in_progress');
   match.sessionStartedAt = new Date(started).toISOString();
-  assert.equal(publicMatch(match, first.email, started).practiceMode, 'peer');
+  assert.equal(publicMatch(match, first.email, started).practiceMode, 'candidate');
   assert.equal(publicMatch(match, first.email, started).durationMinutes, 45);
-  assert.equal(sessionDetails(match, first.email, started + PEER_SWITCH_MS - 1).role, 'interviewer');
-  assert.equal(sessionDetails(match, first.email, started + PEER_SWITCH_MS).role, 'candidate');
-  assert.equal(sessionDetails(match, second.email, started + PEER_SWITCH_MS).role, 'interviewer');
-  assert.equal(currentQuestion(match, second.email, started).prompt, questions[first.email].prompt);
-  assert.equal(currentQuestion(match, second.email, started).hints, undefined);
-  assert.equal(currentQuestion(match, first.email, started + PEER_SWITCH_MS).prompt, questions[second.email].prompt);
-  assert.equal(currentQuestion(match, first.email, started + PEER_SWITCH_MS).hints, undefined);
-  assert.deepEqual(currentQuestion(match, second.email, started + PEER_SWITCH_MS).hints, ['Private hint two']);
+  assert.equal(sessionDetails(match, first.email, started + 44 * 60 * 1000).role, 'candidate');
+  assert.equal(sessionDetails(match, second.email, started + 44 * 60 * 1000).role, 'interviewer');
+  assert.equal(currentQuestion(match, first.email, started + 44 * 60 * 1000).prompt, questions[second.email].prompt);
+  assert.equal(currentQuestion(match, first.email, started + 44 * 60 * 1000).hints, undefined);
+  assert.deepEqual(currentQuestion(match, second.email, started + 44 * 60 * 1000).hints, ['Private hint two']);
 });
 
-test('legacy match without question or feedback records still restores safely', () => {
-  const match = interview();
+test('match without question or feedback records still restores safely', () => {
+  const match = interview('directed');
   delete match.questions;
   delete match.feedback;
   const result = publicMatch(match, second.email);
-  assert.equal(result.practiceMode, 'peer');
+  assert.equal(result.practiceMode, 'interviewer');
   assert.equal(result.feedbackSubmitted, false);
   assert.equal(result.selfFeedback, null);
   assert.ok(result.question.prompt);
-  assert.equal(result.question.hints, undefined);
+  assert.ok(result.question.hints.length);
 });
 
 test('scheduled rooms open ten minutes early without leaking hosted-video credentials', () => {

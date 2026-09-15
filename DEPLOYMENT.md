@@ -6,13 +6,35 @@ Mocksyra uses Netlify for the static frontend, Render for the Socket.IO/WebRTC s
 
 1. Open Supabase Dashboard -> SQL Editor.
 2. Run the complete `supabase-schema.sql` file.
+   - For an existing deployment, run the complete file again. It is safe to rerun and updates the role constraint to Candidate or Interviewer only.
+   - Existing profiles that used Peer Practice are moved to Candidate. Completed interview history is kept.
 3. Open Project Settings -> API Keys and create or copy a server-side `sb_secret_...` key. A legacy `service_role` JWT also works, but the newer secret key is preferred.
 4. Never place this secret in `supabase.js`, Git, Netlify, screenshots, or chat. It belongs only in Render's secret environment variables.
 5. In Authentication -> URL Configuration, add the final Netlify URL as the Site URL and add `https://YOUR-SITE.netlify.app/**` as a redirect URL.
 
 ### Enable Google sign-in
 
-The site includes a **Continue with Google** button. To activate it, create a Google OAuth web client, add Supabase's callback URL (`https://YOUR-PROJECT.supabase.co/auth/v1/callback`) as its authorized redirect URI, then paste the Google client ID and secret in **Supabase Dashboard -> Authentication -> Providers -> Google**. Keep the Netlify URL in Supabase's URL Configuration from step 5. The Google client secret belongs only in Supabase, never in this repository or Netlify.
+1. In Google Cloud Console, create an **OAuth client ID -> Web application**.
+2. Add your deployed site as an **Authorized JavaScript origin** (no trailing slash):
+
+   ```text
+   https://mocksyra.netlify.app
+   ```
+
+3. Add this exact Google **Authorized redirect URI**:
+
+   ```text
+   https://qjghjsapizkqktcbczgj.supabase.co/auth/v1/callback
+   ```
+
+4. If the Google consent screen is still in Testing, add every Google account that needs access as a test user. Otherwise publish the consent screen for production use.
+5. In **Supabase Dashboard -> Authentication -> Providers -> Google**, enable Google and paste the Google client ID and client secret.
+6. In **Supabase Dashboard -> Authentication -> URL Configuration**, set:
+   - **Site URL:** `https://mocksyra.netlify.app`
+   - **Redirect URLs:** add `https://mocksyra.netlify.app/`
+7. If the Netlify site uses a different production domain, replace `https://mocksyra.netlify.app` in the Google JavaScript origin and both Supabase URL fields with that exact HTTPS origin. Add any Netlify preview domain separately before testing it.
+
+Use the Supabase callback only as Google’s redirect URI. Use the Netlify origin as Google’s JavaScript origin and in Supabase URL Configuration. Keep the Google client secret only in Supabase; never add it to this repository or Netlify.
 
 ## 2. Deploy the Render backend
 
@@ -24,6 +46,8 @@ The site includes a **Continue with Google** button. To activate it, create a Go
    - `SUPABASE_SECRET_KEY`: the `sb_secret_...` key copied directly from Supabase.
 4. Keep the service on the Free plan and deploy.
 5. Copy the Render HTTPS URL, such as `https://mocksyra-realtime.onrender.com`.
+
+When an existing backend starts with this version, legacy Peer Practice listings are removed and unfinished legacy peer sessions are closed. Completed history remains available.
 
 If the Netlify site does not exist yet, initially use its temporary/future name, then correct `FRONTEND_ORIGIN` and `APP_URL` in Render after Netlify assigns the final URL.
 

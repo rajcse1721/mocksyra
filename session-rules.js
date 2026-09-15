@@ -1,32 +1,27 @@
-const PRACTICE_MODES = ['peer', 'candidate', 'interviewer'];
+const PRACTICE_MODES = ['candidate', 'interviewer'];
 const CANDIDATE_CRITERIA = ['Problem solving', 'Communication', 'Technical depth'];
 const INTERVIEWER_CRITERIA = ['Question clarity', 'Guidance', 'Professionalism'];
 const SESSION_DURATION_MS = 45 * 60 * 1000;
-const PEER_SWITCH_MS = Math.floor(SESSION_DURATION_MS / 2);
-// Kept as an export for older integrations; peer mode now switches halfway through a 45-minute session.
-const HALF_SESSION_MS = PEER_SWITCH_MS;
 
 function practiceMode(profile) {
-  return PRACTICE_MODES.includes(profile?.practiceMode) ? profile.practiceMode : 'peer';
+  return PRACTICE_MODES.includes(profile?.practiceMode) ? profile.practiceMode : null;
 }
 
 function compatibleModes(first, second) {
   const a = practiceMode(first), b = practiceMode(second);
-  return (a === 'peer' && b === 'peer') || (a === 'candidate' && b === 'interviewer') || (a === 'interviewer' && b === 'candidate');
+  return (a === 'candidate' && b === 'interviewer') || (a === 'interviewer' && b === 'candidate');
 }
 
 function sessionMode(match) {
-  return match.people?.some(person => practiceMode(person) !== 'peer') ? 'directed' : 'peer';
+  return 'directed';
 }
 
 function sessionDetails(match, email, now = Date.now()) {
   const person = match.people.find(item => item.email === email);
   const peer = match.people.find(item => item.email !== email);
   const mode = sessionMode(match);
-  const started = Date.parse(match.sessionStartedAt);
-  const phase = mode === 'peer' && Number.isFinite(started) && now - started >= PEER_SWITCH_MS ? 2 : 1;
-  const startsAsInterviewer = mode === 'directed' ? practiceMode(person) === 'interviewer' : match.people[0].email === email;
-  const isInterviewer = phase === 2 ? !startsAsInterviewer : startsAsInterviewer;
+  const startsAsInterviewer = practiceMode(person) === 'interviewer';
+  const isInterviewer = startsAsInterviewer;
   return {
     practiceMode: practiceMode(person),
     sessionMode: mode,
@@ -34,8 +29,8 @@ function sessionDetails(match, email, now = Date.now()) {
     startsAsInterviewer,
     initiator: match.people[0].email === email,
     role: isInterviewer ? 'interviewer' : 'candidate',
-    peerRole: mode === 'peer' ? 'peer' : practiceMode(peer),
-    phase,
+    peerRole: practiceMode(peer),
+    phase: 1,
     startedAt: match.sessionStartedAt || null,
     serverNow: new Date(now).toISOString(),
     feedbackCriteria: [...(practiceMode(peer) === 'interviewer' ? INTERVIEWER_CRITERIA : CANDIDATE_CRITERIA)],
@@ -74,7 +69,9 @@ function validFeedback(input, criteria, now = Date.now()) {
 
 function feedbackWithCriteria(match, authorEmail) {
   const feedback = match.feedback?.[authorEmail];
-  return feedback ? { ...feedback, criteria: sessionDetails(match, authorEmail).feedbackCriteria } : null;
+  if (!feedback) return null;
+  const criteria = Array.isArray(feedback.criteria) && feedback.criteria.length === 3 ? feedback.criteria : sessionDetails(match, authorEmail).feedbackCriteria;
+  return { ...feedback, criteria: [...criteria] };
 }
 
 function finishFeedback(match, profiles, now = Date.now()) {
@@ -95,4 +92,4 @@ function finishFeedback(match, profiles, now = Date.now()) {
   return true;
 }
 
-module.exports = { PRACTICE_MODES, SESSION_DURATION_MS, PEER_SWITCH_MS, HALF_SESSION_MS, practiceMode, compatibleModes, sessionMode, sessionDetails, currentQuestion, isParticipant, canUseRoom, validFeedback, feedbackWithCriteria, finishFeedback };
+module.exports = { PRACTICE_MODES, SESSION_DURATION_MS, practiceMode, compatibleModes, sessionMode, sessionDetails, currentQuestion, isParticipant, canUseRoom, validFeedback, feedbackWithCriteria, finishFeedback };

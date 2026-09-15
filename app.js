@@ -9,8 +9,6 @@ const PROFILE_KEY = 'mocksyra-profile';
 const EMAIL_KEY = 'mocksyra-email';
 const skills = window.MOCKSYRA_SITE?.technologies || ['JavaScript', 'TypeScript', 'Python', 'Java', 'C++', 'C#', 'Go', 'React', 'Node.js', 'Spring Boot', 'SQL', 'AWS'];
 const interviewTypes = ['Data Structures & Algorithms', 'Frontend', 'Backend', 'System Design', 'Behavioral', 'SQL'];
-const experienceLevels = ['Beginner', 'Intermediate', 'Advanced'];
-const spokenLanguages = ['English', 'Hindi', 'English + Hindi'];
 
 const readJson = (key, fallback) => {
   try { return JSON.parse(localStorage.getItem(key)) || fallback; } catch { return fallback; }
@@ -18,6 +16,7 @@ const readJson = (key, fallback) => {
 
 const state = {
   profile: readJson(PROFILE_KEY, null),
+  authUser: null,
   match: null,
   roomId: null,
   notifications: [],
@@ -50,16 +49,18 @@ const toast = (message, duration = 3200) => {
 
 
 const modes = {
-  candidate: { title: 'Candidate', icon: 'user', duration: 45, target: 'an interviewer', description: 'Get comfortable answering questions. Receive focused feedback from a volunteer interviewer.' },
-  interviewer: { title: 'Interviewer', icon: 'briefcase', duration: 45, target: 'a candidate', description: 'Lead a mock interview, share what you know, and build your interviewing skills.' },
-  peer: { title: 'Peer Practice', icon: 'users', duration: 45, target: 'a practice peer', description: 'Learn both sides. Interview each other and switch roles halfway through.' }
+  candidate: { title: 'Candidate', icon: 'user', duration: 45, target: 'an interviewer', description: 'Answer interview questions and receive useful feedback.' },
+  interviewer: { title: 'Interviewer', icon: 'briefcase', duration: 45, target: 'a candidate', description: 'Lead the interview and help a candidate improve.' }
 };
-const normalizedMode = value => modes[value] ? value : 'peer';
+const normalizedMode = value => modes[value] ? value : 'candidate';
+const currentDisplayName = () => {
+  const metadata = state.authUser?.user_metadata || {};
+  const emailName = (state.authUser?.email || localStorage.getItem(EMAIL_KEY) || '').split('@')[0].replace(/[._-]+/g, ' ');
+  return state.profile?.name || metadata.full_name || metadata.name || emailName || 'Your account';
+};
 const modeFor = () => modes[normalizedMode(state.match?.practiceMode || state.profile?.practiceMode)];
-const isPeerSession = () => !state.match?.sessionMode || state.match.sessionMode === 'peer';
 const sessionMinutes = () => Number(state.match?.durationMinutes) || 45;
 const closedMatch = match => !match || ['completed', 'cancelled', 'expired'].includes(match.status);
-const noteKey = () => `mocksyra-notes-${localStorage.getItem(EMAIL_KEY)}-${state.roomId}`;
 const icon = name => {
   const paths = {
     user: '<circle cx="12" cy="8" r="4"/><path d="M4 21v-2a8 8 0 0 1 16 0v2"/>',
@@ -79,20 +80,18 @@ const icon = name => {
   };
   return `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name] || paths.check}</svg>`;
 };
-function stepper(step) {
-  return `<div class="stepper" aria-label="Interview progress">${['Preferences', 'Your match', 'Practice', 'Feedback'].map((label, i) => `<span class="${i < step ? 'done' : i === step ? 'current' : ''}" ${i === step ? 'aria-current="step"' : ''}><i>${i < step ? '✓' : i + 1}</i>${label}</span>`).join('')}</div>`;
-}
 function frame(content) {
-  const name = state.profile?.name || 'Your profile';
+  const name = currentDisplayName();
   const unread = state.notifications.filter(item => !item.read).length;
   return `<div class="app-shell">
     <header class="app-nav"><div class="shell app-nav-main">
       <a class="brand" href="#home"><i>◒</i> Mocksyra</a>
+      <nav class="app-sections" aria-label="Main"><button class="text-button" data-route="marketplace">Sessions</button><button class="nav-activity" data-route="activity">History${unread ? `<span>${unread}</span>` : ''}</button></nav>
       <nav class="profile-menu" aria-label="Account">
         <span class="mini-avatar">${escapeHtml(name[0] || 'Y')}</span>
         <span>${escapeHtml(name)}</span><button class="text-button" id="logout">Log out</button>
       </nav>
-    </div><nav class="shell app-sections" aria-label="Practice"><button class="text-button" data-route="marketplace">Browse sessions</button><button class="text-button" data-route="onboarding">Offer a time</button><button class="nav-activity" data-route="activity">Activity${unread ? `<span>${unread}</span>` : ''}</button></nav></header><main class="app-main"><div class="shell">${content}</div></main></div>`;
+    </div></header><main class="app-main"><div class="shell">${content}</div></main></div>`;
 }
 function bindRoutes(scope = root) {
   scope.querySelectorAll('[data-route]').forEach(element => {
@@ -135,11 +134,9 @@ function request(event, payload, timeoutMs = 12000) {
 }
 function home() {
   root.innerHTML = document.querySelector('#landing-template').innerHTML;
-  const account = document.createElement('button');
-  account.className = 'text-button';
-  account.textContent = state.authenticated ? 'My activity' : 'Sign in';
-  account.onclick = () => go(state.authenticated ? 'activity' : 'auth');
-  root.querySelector('.nav').insertBefore(account, root.querySelector('.nav .button'));
+  const account = root.querySelector('.simple-landing-nav .button');
+  account.textContent = state.authenticated ? 'Open sessions' : 'Sign in';
+  account.dataset.route = 'marketplace';
   bindRoutes();
   root.querySelectorAll('[data-scroll]').forEach(element => element.onclick = event => {
     event.preventDefault();
@@ -166,96 +163,66 @@ function availableSlots() {
   return slots;
 }
 
-function choiceButtons(values, selected = []) {
-  return values.map(value => `<button class="choice ${selected.includes(value) ? 'selected' : ''}" data-value="${escapeHtml(value)}">${escapeHtml(value)}</button>`).join('');
-}
-
-
 function onboarding() {
   const previous = state.profile || {};
   let selectedMode = normalizedMode(state.selectedMode || previous.practiceMode);
-  const selectedSkills = new Set(previous.languages || []);
   const slots = availableSlots();
-  const selectedSlots = new Set((previous.slots || []).filter(value => slots.some(slot => slot.value === value)));
+  const previousSlot = (previous.slots || []).find(value => Date.parse(value) > Date.now());
+  if (previousSlot && !slots.some(slot => slot.value === previousSlot)) slots.unshift({ value: previousSlot, label: formatSlot(previousSlot) });
+  let selectedSlot = previousSlot || slots[0]?.value || '';
+  let selectedTechnology = previous.languages?.[0] || skills[0];
   const currentMatch = !closedMatch(state.match);
-  root.innerHTML = frame(`${stepper(0)}
-    <div class="onboarding-heading"><p class="eyebrow">MAKE YOUR NEXT INTERVIEW FEEL FAMILIAR</p><h1 class="page-title">How would you like to practise?</h1>
-    <p class="page-subtitle">Pick a role for this session. You can choose a different one next time.</p></div>
-    ${currentMatch ? '<div class="notice">You already have a session waiting. <button class="text-button" data-route="match">Open your match →</button></div>' : ''}
-    <div class="mode-grid" role="group" aria-label="Practice mode">
-      ${['candidate', 'interviewer', 'peer'].map(key => `<button type="button" class="mode-card ${selectedMode === key ? 'selected' : ''}" data-mode="${key}" aria-pressed="${selectedMode === key}">
-        <span class="mode-icon">${icon(modes[key].icon)}</span><span class="mode-check">${icon('check')}</span>
-        <span class="mode-title">${modes[key].title}</span><span class="mode-description">${modes[key].description}</span>
-        <span class="mode-meta">${icon('clock')}${modes[key].duration} minutes · ${key === 'peer' ? 'Both roles' : 'One role'}</span>
-      </button>`).join('')}
-    </div>
-    <div class="onboarding-layout"><form id="preferences-form" class="panel onboarding-form">
-      <div class="panel-heading"><div><p class="eyebrow">THE RIGHT PERSON. THE RIGHT PRACTICE.</p><h2>Your session preferences</h2></div></div>
-      <div class="form-grid">
-        <div><label class="field-label" for="name">Display name</label><input id="name" class="textarea input" maxlength="40" required autocomplete="nickname" value="${escapeHtml(previous.name || '')}" placeholder="What should we call you?"></div>
+  root.innerHTML = frame(`<section class="simple-page onboarding-page">
+    <header class="simple-page-heading"><p class="eyebrow">SET UP AN INTERVIEW</p><h1 class="page-title">Choose your role and time.</h1>
+    <p class="page-subtitle">Every interview has one candidate and one interviewer. Sessions last 45 minutes.</p></header>
+    ${currentMatch ? '<div class="notice">You already have a session waiting. <button class="text-button" data-route="match">Open your booking →</button></div>' : ''}
+    <form id="preferences-form" class="panel onboarding-form clean-form">
+      <fieldset class="role-fieldset"><legend class="field-label">I want to join as</legend><div class="role-selector" role="group" aria-label="Interview role">
+        ${['candidate', 'interviewer'].map(key => `<button type="button" class="role-option ${selectedMode === key ? 'selected' : ''}" data-mode="${key}" aria-pressed="${selectedMode === key}">${icon(modes[key].icon)}<span><b>${modes[key].title}</b><small>${modes[key].description}</small></span></button>`).join('')}
+      </div></fieldset><p class="role-help" id="role-help"></p>
+      <div class="simple-form-grid">
+        <div><label class="field-label" for="name">Display name</label><input id="name" class="textarea input" maxlength="40" required autocomplete="nickname" value="${escapeHtml(previous.name || currentDisplayName())}" placeholder="Your name"></div>
         <div><label class="field-label" for="interview-type">Interview focus</label><select id="interview-type" class="select">${interviewTypes.map(value => `<option ${value === previous.interviewType ? 'selected' : ''}>${escapeHtml(value)}</option>`).join('')}</select></div>
-        <div><label class="field-label" for="experience">Your experience level</label><select id="experience" class="select">${experienceLevels.map(value => `<option ${value === previous.experience ? 'selected' : ''}>${value}</option>`).join('')}</select></div>
-        <div><label class="field-label" for="spoken-language">Conversation language</label><select id="spoken-language" class="select">${spokenLanguages.map(value => `<option ${value === previous.spokenLanguage ? 'selected' : ''}>${value}</option>`).join('')}</select></div>
+        <div><label class="field-label" for="technology">Technology</label><select id="technology" class="select">${skills.map(value => `<option ${value === selectedTechnology ? 'selected' : ''}>${escapeHtml(value)}</option>`).join('')}</select></div>
+        <div><label class="field-label" for="session-time">Available time</label><select id="session-time" class="select">${slots.map(slot => `<option value="${escapeHtml(slot.value)}" ${slot.value === selectedSlot ? 'selected' : ''}>${escapeHtml(slot.label)}</option>`).join('')}</select><small class="input-help">Shown in ${escapeHtml(Intl.DateTimeFormat().resolvedOptions().timeZone)}</small></div>
       </div>
-      <fieldset class="preference-fieldset"><legend class="field-label">What would you like to work on?</legend><p class="field-help">Choose the technologies you’re comfortable using.</p>
-      <div class="choices" id="languages">${skills.map(value => `<button type="button" class="choice ${selectedSkills.has(value) ? 'selected' : ''}" data-value="${escapeHtml(value)}" aria-pressed="${selectedSkills.has(value)}">${escapeHtml(value)}</button>`).join('')}</div></fieldset>
-      <fieldset class="preference-fieldset"><legend class="field-label">When are you available?</legend><p class="field-help">Choose up to 3 start times. All times in ${escapeHtml(Intl.DateTimeFormat().resolvedOptions().timeZone)}.</p>
-      <div class="slots" id="slots">${slots.map(slot => `<button type="button" class="slot ${selectedSlots.has(slot.value) ? 'selected' : ''}" data-value="${slot.value}" aria-pressed="${selectedSlots.has(slot.value)}">${escapeHtml(slot.label)}</button>`).join('')}</div></fieldset>
       <p id="preference-error" class="form-error" role="alert"></p>
-      <div class="form-actions marketplace-actions"><span class="hint" id="selection-count"></span><div><button type="submit" class="button secondary" id="auto-match" ${currentMatch ? 'disabled' : ''}>Match me automatically</button><button type="submit" class="button" id="publish" ${currentMatch ? 'disabled' : ''}>Publish & browse ${icon('arrow')}</button></div></div>
-    </form><aside class="preference-aside"><section class="summary-card">
-      <p class="eyebrow">YOUR NEXT SESSION</p><h2 id="summary-mode"></h2><p id="summary-description"></p>
-      <dl class="session-summary"><div><dt>Session length</dt><dd id="summary-duration"></dd></div><div><dt>You’ll meet</dt><dd id="summary-partner"></dd></div><div><dt>Availability</dt><dd id="summary-times"></dd></div><div><dt>Cost</dt><dd>Free</dd></div></dl>
-      <div class="summary-note">${icon('check')}<span>Real people. A shared workspace. Feedback to take into your next interview.</span></div>
-    </section><p class="field-help">Interviewer sessions are community practice with volunteers. Matching depends on compatible participants being available.</p></aside></div>`);
+      <div class="clean-form-actions"><span>Free · 45 minutes · Live video</span><button type="submit" class="button" id="publish" ${currentMatch ? 'disabled' : ''}><span id="publish-label"></span></button></div>
+    </form></section>`);
   bindRoutes();
-  const updateSummary = () => {
-    const mode = modes[selectedMode];
-    root.querySelector('#summary-mode').textContent = mode.title;
-    root.querySelector('#summary-description').textContent = selectedMode === 'peer' ? 'Switch roles halfway through one focused session.' : selectedMode === 'candidate' ? 'Space to think, answer, and learn.' : 'Guide the conversation. Help someone grow.';
-    root.querySelector('#summary-duration').textContent = `${mode.duration} minutes`;
-    root.querySelector('#summary-partner').textContent = mode.target;
-    root.querySelector('#summary-times').textContent = `${selectedSlots.size} time${selectedSlots.size === 1 ? '' : 's'} selected`;
-    root.querySelector('#selection-count').textContent = `${selectedSlots.size}/3 times selected · ${mode.duration}-minute session`;
+  const updateRole = () => {
+    root.querySelector('#role-help').textContent = selectedMode === 'candidate' ? 'You will answer questions from an interviewer.' : 'You will guide a candidate through the interview.';
+    root.querySelector('#publish-label').textContent = selectedMode === 'candidate' ? 'Publish Candidate time' : 'Publish Interviewer time';
   };
-  root.querySelectorAll('.mode-card').forEach(button => button.onclick = () => {
+  root.querySelectorAll('.role-option').forEach(button => button.onclick = () => {
     selectedMode = button.dataset.mode; state.selectedMode = selectedMode; sessionStorage.setItem('mocksyra-mode', selectedMode);
-    root.querySelectorAll('.mode-card').forEach(item => { item.classList.toggle('selected', item === button); item.setAttribute('aria-pressed', item === button); });
-    updateSummary();
-  });
-  root.querySelectorAll('#languages button').forEach(button => button.onclick = () => {
-    selectedSkills.has(button.dataset.value) ? selectedSkills.delete(button.dataset.value) : selectedSkills.add(button.dataset.value);
-    button.classList.toggle('selected', selectedSkills.has(button.dataset.value)); button.setAttribute('aria-pressed', selectedSkills.has(button.dataset.value));
-  });
-  root.querySelectorAll('#slots button').forEach(button => button.onclick = () => {
-    if (!selectedSlots.has(button.dataset.value) && selectedSlots.size >= 3) return toast('Choose up to three times.');
-    selectedSlots.has(button.dataset.value) ? selectedSlots.delete(button.dataset.value) : selectedSlots.add(button.dataset.value);
-    button.classList.toggle('selected', selectedSlots.has(button.dataset.value)); button.setAttribute('aria-pressed', selectedSlots.has(button.dataset.value)); updateSummary();
+    root.querySelectorAll('.role-option').forEach(item => { item.classList.toggle('selected', item === button); item.setAttribute('aria-pressed', item === button); });
+    updateRole();
   });
   root.querySelector('#preferences-form').onsubmit = async event => {
     event.preventDefault();
-    const error = root.querySelector('#preference-error'), button = event.submitter || root.querySelector('#publish');
+    const error = root.querySelector('#preference-error'), button = root.querySelector('#publish');
     const name = root.querySelector('#name').value.trim();
-    if (!name || !selectedSkills.size || !selectedSlots.size) { error.textContent = 'Add your name, at least one technology, and a time to continue.'; return; }
-    state.profile = { ...previous, name, practiceMode: selectedMode, languages: [...selectedSkills], slots: [...selectedSlots],
-      interviewType: root.querySelector('#interview-type').value, experience: root.querySelector('#experience').value,
-      spokenLanguage: root.querySelector('#spoken-language').value, timezone: Intl.DateTimeFormat().resolvedOptions().timeZone };
+    selectedTechnology = root.querySelector('#technology').value; selectedSlot = root.querySelector('#session-time').value;
+    if (!name || !selectedTechnology || !selectedSlot) { error.textContent = 'Add your name, technology, and available time.'; return; }
+    state.profile = { ...previous, name, practiceMode: selectedMode, languages: [selectedTechnology], slots: [selectedSlot],
+      interviewType: root.querySelector('#interview-type').value, experience: previous.experience || 'Beginner',
+      spokenLanguage: previous.spokenLanguage || 'English', timezone: Intl.DateTimeFormat().resolvedOptions().timeZone };
     localStorage.setItem(PROFILE_KEY, JSON.stringify(state.profile));
-    root.querySelectorAll('#preferences-form button[type="submit"]').forEach(item => { item.disabled = true; });
+    button.disabled = true;
     button.textContent = 'Connecting…'; error.textContent = '';
-    if (!(await connectSocket())) { root.querySelectorAll('#preferences-form button[type="submit"]').forEach(item => { item.disabled = false; }); button.textContent = 'Try again'; error.textContent = 'Could not reach sessions. Your preferences are saved.'; return; }
+    if (!(await connectSocket())) { button.disabled = false; button.textContent = 'Try again'; error.textContent = 'Could not reach sessions. Your preferences are saved.'; return; }
     saveProfileToSupabase(state.profile);
-    const automatic = button.id === 'auto-match';
-    button.textContent = automatic ? 'Finding your best match…' : 'Publishing your times…';
-    const result = await request(automatic ? 'find-match' : 'publish-listing', state.profile);
-    if (!result.ok) { root.querySelectorAll('#preferences-form button[type="submit"]').forEach(item => { item.disabled = false; }); button.textContent = 'Try again'; error.textContent = result.error; return; }
+    button.textContent = 'Publishing…';
+    const result = await request('publish-listing', state.profile);
+    if (!result.ok) { button.disabled = false; button.textContent = 'Try again'; error.textContent = result.error; return; }
     if (result.listings) state.listings = result.listings;
     if (result.profile) { state.profile = { ...state.profile, ...result.profile }; localStorage.setItem(PROFILE_KEY, JSON.stringify(state.profile)); }
     if (result.serverNow) state.serverNow = result.serverNow;
     if (result.activeMatch) { state.match = result.activeMatch; state.roomId = result.activeMatch.roomId; return go('match'); }
-    if (location.hash === '#onboarding') go(automatic ? 'search' : 'marketplace');
+    if (location.hash === '#onboarding') go('marketplace');
   };
-  updateSummary();
+  updateRole();
 }
 async function saveProfileToSupabase(profile) {
   try {
@@ -269,18 +236,6 @@ async function saveProfileToSupabase(profile) {
       updated_at: new Date().toISOString()
     });
   } catch { /* Realtime matching still works if optional profile sync fails. */ }
-}
-
-function marketplaceTitle(mode) {
-  if (mode === 'candidate') return { title: 'Available interviewers', context: 'Browsing as a candidate · showing interviewer availability' };
-  if (mode === 'interviewer') return { title: 'Candidate requests', context: 'Browsing as an interviewer · showing candidates who want to practise' };
-  return { title: 'Available peer sessions', context: 'Browsing for peer practice · both participants switch roles' };
-}
-
-function dateInputValue(value) {
-  const date = new Date(value);
-  const pad = part => String(part).padStart(2, '0');
-  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 }
 
 async function refreshMarketplace(showLoading = true) {
@@ -303,96 +258,84 @@ async function refreshMarketplace(showLoading = true) {
 function renderMarketplaceResults() {
   const results = root.querySelector('#marketplace-results');
   if (!results) return;
-  const technology = root.querySelector('#filter-technology')?.value || '';
-  const type = root.querySelector('#filter-type')?.value || '';
-  const language = root.querySelector('#filter-language')?.value || '';
-  const date = root.querySelector('#filter-date')?.value || '';
-  const sort = root.querySelector('#marketplace-sort')?.value || 'soonest';
-  let sessions = state.listings.flatMap(listing => (listing.slots || []).map(slot => ({ ...listing, slot }))).filter(listing =>
-    (!technology || listing.languages.includes(technology)) && (!type || listing.interviewType === type) &&
-    (!language || listing.spokenLanguage === language) && (!date || dateInputValue(listing.slot) === date)
-  );
-  sessions.sort(sort === 'experience' ? (a, b) => b.sessionsCompleted - a.sessionsCompleted || Date.parse(a.slot) - Date.parse(b.slot) : (a, b) => Date.parse(a.slot) - Date.parse(b.slot));
+  const sessions = state.listings.flatMap(listing => (listing.slots || []).map(slot => ({ ...listing, slot })));
+  sessions.sort((a, b) => Date.parse(a.slot) - Date.parse(b.slot));
   const count = root.querySelector('#marketplace-count');
   if (count) count.textContent = `${sessions.length} available session${sessions.length === 1 ? '' : 's'}`;
   results.setAttribute('aria-busy', 'false');
   if (!sessions.length) {
-    results.innerHTML = '<section class="marketplace-empty"><span>⌁</span><h2>No sessions match these filters yet.</h2><p>Clear the filters, publish another time, or let Mocksyra find a compatible partner automatically.</p><div><button class="button secondary" id="empty-clear">Clear filters</button><button class="button" id="empty-auto">Match me automatically</button></div></section>';
-    root.querySelector('#empty-clear').onclick = clearMarketplaceFilters;
-    root.querySelector('#empty-auto').onclick = automaticMarketplaceMatch;
+    results.innerHTML = '<section class="marketplace-empty"><h2>No open sessions right now</h2><p>Add your availability below and another person can book it.</p></section>';
     return;
   }
-  results.innerHTML = sessions.map(listing => `<article class="session-card" role="listitem" data-listing-id="${escapeHtml(listing.listingId)}">
-    <header class="session-card-person"><span class="listing-avatar">${escapeHtml(listing.name?.[0] || '?')}</span><div><span class="listing-status">● AVAILABLE</span><h2>${escapeHtml(listing.name)}</h2><p>${escapeHtml(listing.experience)} · ${Number(listing.sessionsCompleted) || 0} sessions completed</p></div></header>
-    <div class="session-card-time"><time datetime="${escapeHtml(listing.slot)}">${escapeHtml(formatSlot(listing.slot))}</time><span>45 min</span></div>
-    <h3>${escapeHtml(listing.interviewType)}</h3><p class="session-role">${escapeHtml(modes[listing.practiceMode]?.title || listing.practiceMode)} · ${escapeHtml(listing.spokenLanguage)}</p>
-    <div class="session-tags" aria-label="Technologies">${listing.languages.map(value => `<span>${escapeHtml(value)}</span>`).join('')}</div>
-    <dl class="session-card-meta"><div><dt>Time zone</dt><dd>${escapeHtml(listing.timezone || 'Not provided')}</dd></div><div><dt>Format</dt><dd>Live video + workspace</dd></div></dl>
-    <div class="session-card-actions"><button class="button full" data-book-listing="${escapeHtml(listing.listingId)}" data-slot="${escapeHtml(listing.slot)}" aria-label="Book ${escapeHtml(listing.name)} for ${escapeHtml(formatSlot(listing.slot))}">Book this session ${icon('arrow')}</button></div><p class="session-card-error" role="alert"></p>
-  </article>`).join('');
+  const hasActiveMatch = !closedMatch(state.match);
+  results.innerHTML = sessions.map(listing => {
+    const requiredRole = listing.requiredRole || (listing.practiceMode === 'candidate' ? 'interviewer' : 'candidate');
+    const offer = listing.practiceMode === 'interviewer' ? 'Interviewer available' : 'Candidate looking for an interviewer';
+    return `<article class="session-card" role="listitem" data-listing-id="${escapeHtml(listing.listingId)}">
+    <header class="session-card-person"><span class="listing-avatar">${escapeHtml(listing.name?.[0] || '?')}</span><div><span class="session-role">${offer}</span><h2>${escapeHtml(listing.name)}</h2><p>${escapeHtml(listing.experience)} · ${escapeHtml(listing.spokenLanguage)}</p></div></header>
+    <div class="session-card-main"><div><h3>${escapeHtml(listing.interviewType)}</h3><p>${escapeHtml((listing.languages || []).slice(0, 3).join(' · '))}</p></div><div class="session-card-time"><time datetime="${escapeHtml(listing.slot)}">${escapeHtml(formatSlot(listing.slot))}</time><span>45 minutes</span></div></div>
+    <div class="session-card-actions"><button class="button" data-book-listing="${escapeHtml(listing.listingId)}" data-book-role="${requiredRole}" data-slot="${escapeHtml(listing.slot)}" aria-label="Book with ${escapeHtml(listing.name)} as ${requiredRole}" ${hasActiveMatch ? 'disabled' : ''}>${hasActiveMatch ? 'You already have an interview' : `Book as ${modes[requiredRole].title}`}</button></div><p class="session-card-error" role="alert"></p>
+  </article>`;
+  }).join('');
   root.querySelectorAll('[data-book-listing]').forEach(button => button.onclick = () => bookMarketplaceSession(button));
-}
-
-function clearMarketplaceFilters() {
-  ['#filter-technology', '#filter-type', '#filter-language', '#filter-date'].forEach(selector => { const field = root.querySelector(selector); if (field) field.value = ''; });
-  renderMarketplaceResults();
-}
-
-async function automaticMarketplaceMatch() {
-  const button = root.querySelector('#marketplace-auto') || root.querySelector('#empty-auto');
-  if (button) { button.disabled = true; button.textContent = 'Looking for the best match…'; }
-  const response = await request('find-match', {});
-  if (!response.ok) { if (button) { button.disabled = false; button.textContent = 'Match me automatically'; } return toast(response.error); }
-  if (response.activeMatch) { state.match = response.activeMatch; state.roomId = response.activeMatch.roomId; return go('match'); }
-  toast('No exact match yet. Your availability stays published.');
-  if (button) { button.disabled = false; button.textContent = 'Match me automatically'; }
 }
 
 async function bookMarketplaceSession(button) {
   const card = button.closest('.session-card'), error = card.querySelector('.session-card-error');
+  const listing = state.listings.find(item => item.listingId === button.dataset.bookListing);
+  if (!listing) return refreshMarketplace(false);
+  const role = listing.requiredRole || (listing.practiceMode === 'candidate' ? 'interviewer' : 'candidate');
+  const bookingProfile = {
+    ...(state.profile || {}),
+    name: currentDisplayName(),
+    practiceMode: role,
+    languages: state.profile?.languages?.length ? state.profile.languages : listing.languages,
+    slots: [button.dataset.slot],
+    interviewType: listing.interviewType,
+    experience: state.profile?.experience || 'Beginner',
+    spokenLanguage: state.profile?.spokenLanguage || listing.spokenLanguage || 'English',
+    timezone: Intl.DateTimeFormat().resolvedOptions().timeZone
+  };
   button.disabled = true; button.setAttribute('aria-busy', 'true'); button.textContent = 'Reserving…'; error.textContent = '';
-  const response = await request('book-listing', { listingId: button.dataset.bookListing, slot: button.dataset.slot });
+  const response = await request('book-listing', { listingId: button.dataset.bookListing, slot: button.dataset.slot, profile: bookingProfile });
   if (!response.ok) {
-    error.textContent = response.error; button.disabled = false; button.removeAttribute('aria-busy'); button.textContent = 'Book this session';
+    error.textContent = response.error; button.disabled = false; button.removeAttribute('aria-busy'); button.textContent = `Book as ${modes[role].title}`;
     await refreshMarketplace(false); return;
   }
+  state.profile = { ...bookingProfile, ...(response.profile || {}) };
+  localStorage.setItem(PROFILE_KEY, JSON.stringify(state.profile));
+  saveProfileToSupabase(state.profile);
   state.match = response.activeMatch; state.roomId = response.activeMatch.roomId;
   localStorage.setItem('mocksyra-active-match', JSON.stringify(response.activeMatch));
   go('match');
 }
 
 function marketplace() {
-  if (!state.profile) return go('onboarding');
-  if (!closedMatch(state.match)) return go('match');
-  const heading = marketplaceTitle(normalizedMode(state.profile.practiceMode));
-  root.innerHTML = frame(`${stepper(1)}<section class="marketplace-page" aria-labelledby="marketplace-title">
-    <header class="marketplace-heading"><div><p class="eyebrow">SESSION MARKETPLACE</p><h1 class="page-title" id="marketplace-title" tabindex="-1">${heading.title}</h1><p class="page-subtitle">${heading.context}. All times are shown in your timezone.</p></div><button class="button secondary" data-route="onboarding">Change role or availability</button></header>
-    <section class="published-banner"><div><span>● YOUR LISTING IS LIVE</span><b>${escapeHtml(modes[normalizedMode(state.profile.practiceMode)].title)} · ${state.profile.slots?.length || 0} time${state.profile.slots?.length === 1 ? '' : 's'} offered</b></div><button class="text-button" id="cancel-listing">Unpublish</button></section>
-    <form class="marketplace-filters" id="marketplace-filters" aria-label="Filter available sessions"><label>Technology<select class="select" id="filter-technology"><option value="">All technologies</option>${skills.map(value => `<option>${escapeHtml(value)}</option>`).join('')}</select></label><label>Interview focus<select class="select" id="filter-type"><option value="">All interview types</option>${interviewTypes.map(value => `<option>${escapeHtml(value)}</option>`).join('')}</select></label><label>Language<select class="select" id="filter-language"><option value="">All languages</option>${spokenLanguages.map(value => `<option>${escapeHtml(value)}</option>`).join('')}</select></label><label>Date<input class="select" id="filter-date" type="date"></label><button type="button" class="text-button" id="clear-filters">Clear filters</button></form>
-    <div class="marketplace-toolbar"><p id="marketplace-count" role="status" aria-live="polite">Loading sessions…</p><div><button class="text-button" id="refresh-marketplace">Refresh</button><select class="select compact" id="marketplace-sort" aria-label="Sort sessions"><option value="soonest">Soonest first</option><option value="experience">Most experienced</option></select></div></div>
-    <div id="marketplace-results" class="session-list" role="list" aria-busy="true"><p class="empty-state">Loading available sessions…</p></div>
-    <section class="automatic-match-card"><div><span class="eyebrow">WANT THE CLOSEST FIT?</span><h2>Let Mocksyra choose for you.</h2><p>Automatic matching checks role, focus, technology, language, and shared time.</p></div><button class="button button-light" id="marketplace-auto">Match me automatically</button></section>
+  const active = !closedMatch(state.match) ? state.match : null;
+  const joinState = active ? scheduledJoinState(active) : null;
+  const waiting = state.profile?.status === 'waiting';
+  root.innerHTML = frame(`<section class="marketplace-page sessions-board" aria-labelledby="marketplace-title">
+    <header class="marketplace-heading"><div><h1 class="page-title" id="marketplace-title" tabindex="-1">Interview sessions</h1><p class="page-subtitle">Book an open time or add your own availability.</p></div><button class="button" data-create-role="candidate">Create a session</button></header>
+    ${active ? `<section class="upcoming-card"><div><span>Your next interview</span><h2>${escapeHtml(active.interviewType)} with ${escapeHtml(active.peer.name)}</h2><p>${escapeHtml(formatSlot(active.sharedSlot))} · You are the ${escapeHtml(modes[normalizedMode(active.practiceMode)].title)}</p></div><button class="button" data-route="match">${active.status === 'feedback_pending' ? 'Complete feedback' : joinState.allowed ? 'Join now' : 'View booking'}</button></section>` : ''}
+    ${waiting ? `<div class="availability-inline"><span>Your ${escapeHtml(modes[normalizedMode(state.profile.practiceMode)].title)} slot is published for ${escapeHtml(formatSlot(state.profile.slots?.[0]))}.</span><button class="text-button" id="cancel-listing">Remove listing</button></div>` : ''}
+    <section class="available-section"><div class="section-row"><div><h2>Available interviews</h2><p>Booking automatically gives you the opposite role.</p></div><p class="marketplace-count" id="marketplace-count" role="status" aria-live="polite">Loading…</p></div>
+      <div id="marketplace-results" class="session-list" role="list" aria-busy="true"><p class="empty-state">Loading available sessions…</p></div>
+    </section>
+    <section class="offer-card"><div><h2>Don't see the right time?</h2><p>Publish one time and let the other person book it.</p></div><div><button class="button secondary" data-create-role="candidate">Offer as Candidate</button><button class="button secondary" data-create-role="interviewer">Offer as Interviewer</button></div></section>
   </section>`);
   bindRoutes();
   root.querySelector('#marketplace-title').focus({ preventScroll: true });
-  root.querySelectorAll('#marketplace-filters select,#marketplace-filters input,#marketplace-sort').forEach(field => field.onchange = renderMarketplaceResults);
-  root.querySelector('#clear-filters').onclick = clearMarketplaceFilters;
-  root.querySelector('#refresh-marketplace').onclick = () => refreshMarketplace();
-  root.querySelector('#marketplace-auto').onclick = automaticMarketplaceMatch;
-  root.querySelector('#cancel-listing').onclick = async () => { const response = await request('cancel-search'); if (!response.ok) return toast(response.error); state.profile.status = 'idle'; toast('Your availability has been unpublished.'); go('onboarding'); };
+  root.querySelectorAll('[data-create-role]').forEach(button => button.onclick = () => {
+    state.selectedMode = button.dataset.createRole;
+    sessionStorage.setItem('mocksyra-mode', state.selectedMode);
+    go('onboarding');
+  });
+  if (waiting) root.querySelector('#cancel-listing').onclick = async () => { const response = await request('cancel-search'); if (!response.ok) return toast(response.error); state.profile.status = 'idle'; localStorage.setItem(PROFILE_KEY, JSON.stringify(state.profile)); toast('Your listing was removed.'); marketplace(); };
   refreshMarketplace();
 }
 
 function search() {
-  if (!state.profile) return go('onboarding');
-  root.innerHTML = frame(`${stepper(1)}
-    <section class="match-card searching-card"><span class="match-badge">● LIVE MATCHING</span>
-      <div class="large-match"><div class="portrait coral">${escapeHtml(state.profile.name[0])}</div><div class="link pulse">⌁</div><div class="portrait lime">?</div></div>
-      <h2>Looking for ${modes[normalizedMode(state.profile.practiceMode)].target}…</h2><p class="page-subtitle centered">We require a shared time, interview type, and technology. You can safely return later—your queue entry remains until its selected times pass.</p>
-      <div class="search-tags"><span>${modes[normalizedMode(state.profile.practiceMode)].title}</span><span>${escapeHtml(state.profile.interviewType)}</span><span>${escapeHtml(state.profile.experience)}</span><span>${escapeHtml(state.profile.languages.join(' · '))}</span></div>
-      <button class="text-button" id="cancel">Cancel search</button></section>`);
-  bindRoutes();
-  root.querySelector('#cancel').onclick = async () => { const result = await request('cancel-search'); if (!result.ok) return toast(result.error); state.profile.status = 'idle'; toast('Search cancelled. Update your preferences whenever you’re ready.'); go('onboarding'); };
+  go('marketplace');
 }
 
 function formatSlot(value) {
@@ -437,22 +380,20 @@ function scheduledJoinState(matchData) {
 function match() {
   if (!state.match || !state.profile) return go('onboarding');
   const peer = state.match.peer;
-  const reasons = state.match.reasons || [];
   const feedbackPending = state.match.status === 'feedback_pending';
-  const selectedSession = state.match.source === 'marketplace' || state.match.bookingType === 'marketplace';
   const joinState = scheduledJoinState(state.match);
-  root.innerHTML = frame(`<div class="progress"><i class="done"></i><i class="done"></i><i></i><i></i></div>
-    <h1 class="page-title">${selectedSession ? 'Your session is booked.' : 'Your practice match is ready.'}</h1><p class="page-subtitle">${modeFor().title} · ${sessionMinutes()} minutes · ${isPeerSession() ? "You’ll switch roles halfway through." : `You will stay in the ${escapeHtml(state.match.practiceMode)} role.`}</p>
-    <div class="match-layout"><section class="match-card"><span class="match-badge">${selectedSession ? '✓ SESSION RESERVED' : `✦ ${state.match.score}% COMPATIBLE`}</span>
-      <div class="large-match"><div><div class="portrait coral">${escapeHtml(state.profile.name[0])}</div><small>You</small></div><div class="link">⌁</div><div><div class="portrait lime">${escapeHtml(peer.name[0])}</div><small>${escapeHtml(peer.name.split(' ')[0])}</small></div></div>
-      <div class="mode-pill">${icon(modeFor().icon)} ${modeFor().title} · ${sessionMinutes()} min</div><h2>Meet ${escapeHtml(peer.name)}</h2>
-      <p class="page-subtitle">${escapeHtml(state.match.interviewType)} · ${escapeHtml(peer.experience)} · ${escapeHtml(formatSlot(state.match.sharedSlot))}</p>
-      <div class="reason-list">${reasons.map(reason => `<span>✓ ${escapeHtml(reason)}</span>`).join('')}</div>
-      <p class="join-status" id="join-status">${feedbackPending ? 'Your feedback is ready to complete.' : escapeHtml(joinState.message)}</p><div class="button-row"><button class="button secondary" id="calendar">Add to calendar</button><button class="button" id="join" ${!feedbackPending && !joinState.allowed ? 'disabled' : ''}>${feedbackPending ? 'Continue to feedback' : joinState.allowed ? 'Join interview room' : 'Room not open yet'} <b>→</b></button></div>
-    </section><aside class="side-card device-card"><h3>Before you begin</h3><p>Test your devices here. If another browser is using your camera, Mocksyra automatically tries audio-only mode.</p>
-      <video id="device-preview" autoplay muted playsinline hidden></video><p class="device-status" id="device-status">Devices not tested</p>
-      <button class="button button-light full" id="test-devices">Test camera & mic</button><div class="peer-stat"><b>${Number(peer.sessionsCompleted || 0)}</b><span>completed peer sessions</span></div>
-    </aside></div>${state.match.status === 'matched' ? '<button class="text-button cancel-match" id="cancel-match">Cancel this match and change preferences</button>' : ''}`);
+  const partnerRole = state.match.peerRole === 'candidate' ? 'Candidate' : 'Interviewer';
+  root.innerHTML = frame(`<section class="simple-page booking-page">
+    <header class="simple-page-heading"><h1 class="page-title">Your interview</h1><p class="page-subtitle">The private room opens shortly before the scheduled time.</p></header>
+    <article class="booking-card">
+      <div class="booking-partner"><span class="listing-avatar">${escapeHtml(peer.name?.[0] || '?')}</span><div><small>${partnerRole}</small><h2>${escapeHtml(peer.name)}</h2><p>${escapeHtml(peer.experience)}</p></div></div>
+      <dl class="booking-details"><div><dt>Your role</dt><dd>${escapeHtml(modeFor().title)}</dd></div><div><dt>Interview</dt><dd>${escapeHtml(state.match.interviewType)}</dd></div><div><dt>When</dt><dd>${escapeHtml(formatSlot(state.match.sharedSlot))}</dd></div><div><dt>Duration</dt><dd>${sessionMinutes()} minutes</dd></div></dl>
+      <p class="join-status" id="join-status">${feedbackPending ? 'Complete your feedback to finish this interview.' : escapeHtml(joinState.message)}</p>
+      <div class="booking-actions"><button class="button secondary" id="test-devices">Test camera & mic</button><button class="button secondary" id="calendar">Add to calendar</button><button class="button" id="join" ${!feedbackPending && !joinState.allowed ? 'disabled' : ''}>${feedbackPending ? 'Continue to feedback' : joinState.allowed ? 'Join interview' : 'Room not open yet'}</button></div>
+      <div class="device-check-inline"><video id="device-preview" autoplay muted playsinline hidden></video><p class="device-status" id="device-status">Camera and microphone not tested</p></div>
+    </article>
+    ${state.match.status === 'matched' ? '<button class="text-button cancel-match" id="cancel-match">Cancel interview</button>' : ''}
+  </section>`);
   bindRoutes();
   root.querySelector('#test-devices').onclick = deviceCheck;
   root.querySelector('#calendar').onclick = downloadCalendar;
@@ -460,7 +401,7 @@ function match() {
     if (!confirm('Cancel this match for both participants?')) return;
     const result = await request('cancel-match', state.roomId);
     if (!result.ok) return toast(result.error);
-    clearActiveMatch(); go('onboarding');
+    clearActiveMatch(); go('marketplace');
   });
   root.querySelector('#join').onclick = async () => {
     if (feedbackPending) return go('feedback');
@@ -474,7 +415,7 @@ function match() {
   if (!feedbackPending) state.joinClock = setInterval(() => {
     const next = scheduledJoinState(state.match), button = root.querySelector('#join'), status = root.querySelector('#join-status');
     if (!button || !status) return clearInterval(state.joinClock);
-    button.disabled = !next.allowed; button.innerHTML = `${next.allowed ? 'Join interview room' : 'Room not open yet'} <b>→</b>`; status.textContent = next.message;
+    button.disabled = !next.allowed; button.textContent = next.allowed ? 'Join interview' : 'Room not open yet'; status.textContent = next.message;
   }, 30_000);
 }
 
@@ -483,9 +424,9 @@ function downloadCalendar() {
   if (!state.match?.sharedSlot) return toast('No scheduled time is available.');
   const start = new Date(state.match.sharedSlot), end = new Date(start.getTime() + sessionMinutes() * 60 * 1000);
   const url = `${location.origin}${location.pathname}#match`;
-  const body = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Mocksyra//Peer Interview//EN', 'BEGIN:VEVENT',
+  const body = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Mocksyra//Interview//EN', 'BEGIN:VEVENT',
     `UID:${state.roomId}@mocksyra`, `DTSTAMP:${calendarDate(new Date())}`, `DTSTART:${calendarDate(start)}`, `DTEND:${calendarDate(end)}`,
-    `SUMMARY:Mocksyra interview with ${state.match.peer.name}`, `DESCRIPTION:Open Mocksyra to join your peer interview: ${url}`, `URL:${url}`, 'END:VEVENT', 'END:VCALENDAR'].join('\r\n');
+    `SUMMARY:Mocksyra interview with ${state.match.peer.name}`, `DESCRIPTION:Open Mocksyra to join your interview: ${url}`, `URL:${url}`, 'END:VEVENT', 'END:VCALENDAR'].join('\r\n');
   const link = document.createElement('a');
   link.href = URL.createObjectURL(new Blob([body], { type: 'text/calendar' })); link.download = 'mocksyra-interview.ics'; link.click(); URL.revokeObjectURL(link.href);
 }
@@ -493,35 +434,25 @@ function downloadCalendar() {
 function session() {
   const dailySession = state.match?.videoProvider === 'daily';
   if (!state.match || (!dailySession && !state.stream?.active)) return go('match');
-  const peer = state.match.peer, question = state.match.question || {}, startsAsInterviewer = state.match.startsAsInterviewer;
-  const peerSession = isPeerSession(), minutes = sessionMinutes(), initialTimer = `${minutes}:00`;
-  const sessionIntro = peerSession ? 'This 45-minute session switches roles automatically halfway through.' : `This focused ${minutes}-minute session starts when both participants join.`;
-  const agenda = peerSession
-    ? `<div class="agenda-item active" id="agenda-one"><b>Part 1 · ${startsAsInterviewer ? escapeHtml(peer.name.split(' ')[0]) : 'You'} ${startsAsInterviewer ? 'is' : 'are'} candidate</b><small>First half of the session.</small></div><div class="agenda-item" id="agenda-two"><b>Part 2 · ${startsAsInterviewer ? 'You are' : `${escapeHtml(peer.name.split(' ')[0])} is`} candidate</b><small>Roles switch automatically.</small></div>`
-    : `<div class="agenda-item active" id="agenda-one"><b>${startsAsInterviewer ? 'You are leading the interview' : `You are the candidate`}</b><small>Your role stays the same for this session.</small></div>`;
+  const peer = state.match.peer, question = state.match.question || {};
+  const minutes = sessionMinutes(), initialTimer = `${minutes}:00`;
   const videoSurface = dailySession ? `<div class="call-stage daily-call-stage tool-panel" id="video-panel"><div class="call-top"><span class="live">● HOSTED VIDEO</span><span id="timer">${initialTimer}</span></div><p class="daily-status" id="daily-status">Preparing your private video room…</p><div class="daily-container" id="daily-container"></div><div class="daily-finish"><button class="call-action end" id="complete"><b>×</b><span>Finish interview</span></button></div></div>` : `<div class="call-stage tool-panel" id="video-panel"><div class="call-top"><span class="live">● LIVE SESSION</span><span id="timer">${initialTimer}</span></div>
         <div class="connection-banner" id="connection"><i></i><span>Waiting for ${escapeHtml(peer.name)} to join the room…</span></div>
         <div class="call-users"><div class="video"><video id="local" autoplay muted playsinline></video><small>You</small></div><div class="video"><video id="remote" autoplay playsinline></video><small id="peer-status">${escapeHtml(peer.name)} · not connected</small></div></div>
         <div class="call-controls"><button class="call-action" id="mic" title="Toggle microphone"><b>●</b><span>Microphone</span></button><button class="call-action" id="cam" title="Toggle camera"><b>◉</b><span>Camera</span></button><button class="call-action end" id="complete" title="Finish interview"><b>×</b><span>Finish</span></button></div></div>`;
-  root.innerHTML = frame(`<div class="progress"><i class="done"></i><i class="done"></i><i class="done"></i><i></i></div>
-    <div class="session-heading"><div><h1 class="page-title">Interview room</h1><p class="page-subtitle">${sessionIntro}</p></div><div class="room-code">ROOM ${escapeHtml(state.roomId.slice(-6).toUpperCase())}</div></div>
-    <div class="session-tools"><button class="tool-tab selected" data-tab="video-panel">Video</button><button class="tool-tab" data-tab="workspace-panel">Shared workspace</button><button class="tool-tab" data-tab="chat-panel">Chat</button></div>
-    <div class="session"><section class="session-main">
+  root.innerHTML = frame(`<section class="simple-page live-session-page">
+    <header class="simple-session-heading"><div><p class="eyebrow">LIVE INTERVIEW</p><h1 class="page-title">${escapeHtml(state.match.interviewType)}</h1><p class="page-subtitle">You are the ${escapeHtml(modeFor().title.toLowerCase())} · with ${escapeHtml(peer.name)}</p></div><div class="simple-timer" id="side-timer">${initialTimer}</div></header>
+    <div class="session-tools"><button class="tool-tab selected" data-tab="video-panel">Video</button><button class="tool-tab" data-tab="workspace-panel">Workspace</button></div>
+    <section class="session-main">
       ${videoSurface}
       <div class="workspace-card tool-panel" id="workspace-panel" hidden><div class="workspace-head"><div><span class="eyebrow">LIVE SHARED PAD</span><h2 id="question-title">${escapeHtml(question.title || 'Collaborative workspace')}</h2></div><select id="code-language" class="select compact">${['JavaScript', 'TypeScript', 'Python', 'Java', 'C++', 'SQL', 'Plain text'].map(value => `<option ${value === state.workspace.language ? 'selected' : ''}>${value}</option>`).join('')}</select></div>
         <div class="question-box" id="question-brief"><b>Interview question</b><p>${escapeHtml(question.prompt || 'Use the shared pad to work through your interview question.')}</p>${question.hints?.length ? `<details><summary>Hints for the interviewer</summary><ul>${question.hints.map(hint => `<li>${escapeHtml(hint)}</li>`).join('')}</ul></details>` : ''}</div>
         <textarea id="shared-code" class="code-editor" spellcheck="false">${escapeHtml(state.workspace.code || question.starter || '')}</textarea>
-        <div class="workspace-actions"><span id="sync-status">Synced with your peer</span><button class="button secondary" id="copy-code">Copy</button><button class="button" id="run-code">Run JavaScript</button></div><pre id="code-output" class="code-output">Output will appear here.</pre></div>
-      <div class="workspace-card tool-panel" id="chat-panel" hidden><div class="workspace-head"><div><span class="eyebrow">ROOM CHAT</span><h2>Messages with ${escapeHtml(peer.name)}</h2></div></div><div class="chat-messages" id="chat-messages"></div><div class="chat-compose"><input id="chat-input" class="textarea input" maxlength="500" placeholder="Send a useful link or short message"><button class="button" id="send-chat">Send</button></div></div>
-    </section><aside class="agenda"><h3>Session agenda</h3><div class="timer" id="side-timer">${initialTimer}</div>
-      ${agenda}
-      <div class="agenda-item" id="agenda-feedback"><b>Peer feedback</b><small>Unlocked after the call.</small></div>
-      <label class="field-label">PRIVATE NOTES</label><textarea id="private-notes" class="textarea" placeholder="Only you can see these notes."></textarea></aside></div>`);
+        <div class="workspace-actions"><span id="sync-status">Synced with your partner</span><button class="button secondary" id="copy-code">Copy</button><button class="button" id="run-code">Run JavaScript</button></div><pre id="code-output" class="code-output">Output will appear here.</pre></div>
+    </section></section>`);
   bindRoutes();
   if (!dailySession) root.querySelector('#local').srcObject = state.stream;
-  root.querySelector('#private-notes').value = localStorage.getItem(`mocksyra-notes-${state.roomId}`) || '';
-  root.querySelector('#private-notes').oninput = event => localStorage.setItem(`mocksyra-notes-${state.roomId}`, event.target.value);
-  bindSessionTabs(); bindWorkspace(); bindChat(); renderChat();
+  bindSessionTabs(); bindWorkspace();
   if (dailySession) prepareDailyCall(); else {
     prepareCall();
     root.querySelector('#mic').onclick = event => toggleTrack('audio', event.currentTarget);
@@ -585,7 +516,7 @@ function prepareCall() {
   pc.onicecandidate = event => { if (event.candidate) socket.emit('signal', { roomId: state.roomId, data: { candidate: event.candidate } }); };
   pc.onconnectionstatechange = () => {
     if (pc.connectionState === 'failed') updateConnection('Connection failed — check network or try audio-only mode', false);
-    if (pc.connectionState === 'disconnected') updateConnection('Peer connection interrupted — retrying…', false);
+    if (pc.connectionState === 'disconnected') updateConnection('Video connection interrupted — retrying…', false);
   };
   socket.emit('join-session', state.roomId); socket.emit('workspace-request', state.roomId);
 }
@@ -596,24 +527,21 @@ async function handleSignal(data) {
     if (data.offer) { await pc.setRemoteDescription(data.offer); await flushCandidates(); const answer = await pc.createAnswer(); await pc.setLocalDescription(answer); socket.emit('signal', { roomId: state.roomId, data: { answer } }); }
     else if (data.answer) { await pc.setRemoteDescription(data.answer); await flushCandidates(); }
     else if (data.candidate) { if (pc.remoteDescription) await pc.addIceCandidate(data.candidate); else state.pendingCandidates.push(data.candidate); }
-  } catch { updateConnection('Could not establish the peer connection. Try rejoining.', false); }
+  } catch { updateConnection('Could not establish the video connection. Try rejoining.', false); }
 }
 async function flushCandidates() { while (state.pendingCandidates.length) await state.pc.addIceCandidate(state.pendingCandidates.shift()); }
 function updateConnection(text, ready) {
   const status = root.querySelector('#peer-status'), banner = root.querySelector('#connection');
   if (status) status.textContent = text;
-  if (banner) { banner.classList.toggle('ready', ready); banner.querySelector('span').textContent = ready ? 'Secure peer-to-peer call connected' : text; }
+  if (banner) { banner.classList.toggle('ready', ready); banner.querySelector('span').textContent = ready ? 'Secure video connected' : text; }
 }
 
 function startSyncedTimer(startedAt) {
   clearInterval(state.clock); state.sessionStartedAt = new Date(startedAt).getTime();
   const update = () => {
-    const elapsed = Math.max(0, Math.floor((Date.now() - state.sessionStartedAt) / 1000)), totalSeconds = sessionMinutes() * 60, switchAt = Math.floor(totalSeconds / 2), remaining = Math.max(0, totalSeconds - elapsed);
+    const elapsed = Math.max(0, Math.floor((Date.now() - state.sessionStartedAt) / 1000)), totalSeconds = sessionMinutes() * 60, remaining = Math.max(0, totalSeconds - elapsed);
     const value = `${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, '0')}`;
     const timer = root.querySelector('#timer'), side = root.querySelector('#side-timer'); if (timer) timer.textContent = value; if (side) side.textContent = value;
-    const secondHalf = isPeerSession() && elapsed >= switchAt;
-    root.querySelector('#agenda-one')?.classList.toggle('active', !secondHalf); root.querySelector('#agenda-two')?.classList.toggle('active', secondHalf);
-    if (isPeerSession() && elapsed === switchAt) toast('Halfway point — interviewer and candidate roles have switched.', 5000);
     if (!remaining) socket.emit('complete-session', state.roomId);
   };
   update(); state.clock = setInterval(update, 1000);
@@ -661,14 +589,12 @@ function feedback() {
   const criteria = Array.isArray(state.match.feedbackCriteria) && state.match.feedbackCriteria.length === 3
     ? state.match.feedbackCriteria
     : ['Problem solving', 'Communication', 'Technical depth'];
-  root.innerHTML = frame(`<div class="progress"><i class="done"></i><i class="done"></i><i class="done"></i><i class="done"></i></div>
-    <h1 class="page-title">Share thoughtful feedback.</h1><p class="page-subtitle">Your peer sees it only after both of you submit.</p>
-    <div class="feedback-grid"><section class="panel"><h2>Rate ${escapeHtml(peer.name.split(' ')[0])}'s interview</h2>
+  root.innerHTML = frame(`<section class="simple-page feedback-page"><header class="simple-page-heading"><p class="eyebrow">INTERVIEW COMPLETE</p><h1 class="page-title">Share useful feedback.</h1><p class="page-subtitle">Your partner sees it after both of you submit.</p></header>
+    <section class="panel feedback-card"><h2>Feedback for ${escapeHtml(peer.name.split(' ')[0])}</h2>
       ${criteria.map((criterion, index) => `<label class="field-label">${criterion.toUpperCase()}</label><div class="rating-row" data-index="${index}">${[1, 2, 3, 4, 5].map(score => `<button data-score="${score}" aria-label="${score} stars">★</button>`).join('')}</div>`).join('')}
-      <label class="field-label">WHAT DID THEY DO WELL?</label><textarea id="strength" class="textarea" maxlength="1200" placeholder="Be specific and useful."></textarea></section>
-      <section class="panel"><h2>Help them improve</h2><label class="field-label">ONE AREA TO WORK ON</label><textarea id="improve" class="textarea" maxlength="1200" placeholder="Suggest one actionable next step."></textarea>
-      <label class="field-label">WOULD YOU PRACTISE TOGETHER AGAIN?</label><div class="choices"><button class="choice" data-repeat="yes">Yes</button><button class="choice" data-repeat="no">Not now</button></div>
-      <div class="form-actions"><span class="hint">Feedback is private to your peer.</span><button class="button" id="submit">Submit feedback <b>→</b></button></div></section></div>`);
+      <div class="feedback-fields"><label><span class="field-label">WHAT WENT WELL?</span><textarea id="strength" class="textarea" maxlength="1200" placeholder="Be specific and useful."></textarea></label><label><span class="field-label">ONE AREA TO IMPROVE</span><textarea id="improve" class="textarea" maxlength="1200" placeholder="Suggest one actionable next step."></textarea></label></div>
+      <label class="field-label">BOOK ANOTHER INTERVIEW TOGETHER?</label><div class="choices"><button type="button" class="choice" data-repeat="yes">Yes</button><button type="button" class="choice" data-repeat="no">Not now</button></div>
+      <div class="clean-form-actions"><span>Private between both participants</span><button type="button" class="button" id="submit">Submit feedback ${icon('arrow')}</button></div></section></section>`);
   bindRoutes(); const scores = [0, 0, 0]; let practiseAgain = null;
   root.querySelectorAll('.rating-row').forEach(row => row.querySelectorAll('button').forEach(button => button.onclick = () => {
     const index = Number(row.dataset.index), score = Number(button.dataset.score); scores[index] = score;
@@ -679,7 +605,7 @@ function feedback() {
     const strength = root.querySelector('#strength').value.trim(), improve = root.querySelector('#improve').value.trim();
     if (scores.some(score => !score)) return toast(`Please rate all ${criteria.length} areas.`);
     if (strength.length < 5 || improve.length < 5) return toast('Add a short strength and an actionable improvement.');
-    const button = root.querySelector('#submit'); button.disabled = true; button.textContent = 'Waiting for peer…';
+    const button = root.querySelector('#submit'); button.disabled = true; button.textContent = 'Waiting for partner…';
     socket.emit('submit-feedback', { roomId: state.roomId, feedback: { scores, strength, improve, practiseAgain } });
   };
 }
@@ -687,23 +613,18 @@ function feedback() {
 function dashboard() {
   if (!state.feedback || !state.profile || !state.match) return go('activity');
   const feedback = state.feedback, average = (feedback.scores.reduce((sum, score) => sum + score, 0) / feedback.scores.length).toFixed(1);
-  root.innerHTML = frame(`<div class="eyebrow"><span></span> SESSION COMPLETE</div><h1 class="page-title">Nice work, ${escapeHtml(state.profile.name.split(' ')[0])}.</h1>
-    <p class="page-subtitle">Both feedback forms are in. Your result has been added to Activity.</p>
-    <div class="dashboard-grid"><section class="panel"><h2>Your practice summary</h2><div class="metric-row"><div class="metric"><b>1</b><small>SESSION COMPLETE</small></div><div class="metric"><b>${average}/5</b><small>PEER RATING</small></div><div class="metric"><b>${sessionMinutes()}</b><small>PLANNED MINUTES</small></div></div>
-      <h3 class="section-subhead">Feedback from ${escapeHtml(state.match.peer.name)}</h3><div class="feedback-item"><b>What you did well</b>${escapeHtml(feedback.strength || 'No written feedback provided.')}</div><div class="feedback-item"><b>Focus for next time</b>${escapeHtml(feedback.improve || 'Keep practising clear problem decomposition.')}</div>
-    </section><aside class="side-card"><h3>Keep the momentum</h3><p>Use Activity to revisit feedback or download your session summary.</p><button class="button button-light full" data-route="onboarding">Book another session <b>→</b></button><button class="text-button light-link" data-route="activity">View activity</button></aside></div>`);
+  root.innerHTML = frame(`<section class="simple-page result-page"><header class="simple-page-heading"><p class="eyebrow">INTERVIEW COMPLETE</p><h1 class="page-title">Nice work, ${escapeHtml(state.profile.name.split(' ')[0])}.</h1><p class="page-subtitle">Your feedback is saved in Activity.</p></header>
+    <section class="panel result-card"><div class="result-rating"><span>${average}/5</span><p>Feedback from ${escapeHtml(state.match.peer.name)}</p></div><div class="feedback-item"><b>What went well</b>${escapeHtml(feedback.strength || 'No written feedback provided.')}</div><div class="feedback-item"><b>Focus for next time</b>${escapeHtml(feedback.improve || 'Keep practising clear problem decomposition.')}</div><div class="booking-actions"><button class="button" data-route="marketplace">Find another interview</button><button class="button secondary" data-route="activity">View activity</button></div></section></section>`);
   bindRoutes();
 }
 
 function activity() {
-  const completed = state.history.length, averages = state.history.flatMap(item => item.feedbackReceived?.scores || []);
-  const average = averages.length ? (averages.reduce((sum, score) => sum + score, 0) / averages.length).toFixed(1) : '—';
-  root.innerHTML = frame(`<button class="back" data-route="onboarding">← BACK TO MATCHING</button><h1 class="page-title">Your Mocksyra activity</h1><p class="page-subtitle">Matches, reminders, and completed feedback stay together here.</p>
-    <div class="metric-row activity-metrics"><div class="metric"><b>${completed}</b><small>SESSIONS</small></div><div class="metric"><b>${average}${average === '—' ? '' : '/5'}</b><small>AVERAGE RATING</small></div><div class="metric"><b>${state.history.reduce((total, item) => total + (Number(item.durationMinutes) || 45), 0)}</b><small>PLANNED MINUTES</small></div></div>
-    <div class="activity-grid"><section class="panel"><div class="panel-heading"><h2>Session history</h2>${state.match ? '<button class="button secondary" data-route="match">Open active match</button>' : ''}</div>
+  const completed = state.history.length;
+  root.innerHTML = frame(`<section class="simple-page activity-page"><header class="simple-page-heading"><p class="eyebrow">ACTIVITY</p><h1 class="page-title">Your interviews</h1><p class="page-subtitle">${completed} completed interview${completed === 1 ? '' : 's'}.</p></header>
+    ${state.match ? '<div class="notice">You have an upcoming interview. <button class="text-button" data-route="match">Open booking →</button></div>' : ''}
+    <section class="panel"><div class="panel-heading"><h2>Interview history</h2><button class="button secondary" data-route="marketplace">Find an interview</button></div>
       <div class="history-list">${state.history.length ? state.history.map((item, index) => `<article class="history-card"><div><span class="match-badge">${escapeHtml(item.interviewType)}</span><h3>${escapeHtml(item.peer.name)}</h3><p>${escapeHtml(formatSlot(item.sharedSlot))} · ${escapeHtml(item.peer.experience)}</p></div><div><b>${item.feedbackReceived ? `${(item.feedbackReceived.scores.reduce((a, b) => a + b, 0) / 3).toFixed(1)}/5` : 'Pending'}</b><button class="text-button" data-summary="${index}">Download summary</button></div></article>`).join('') : '<p class="empty-state">Complete your first interview to build a feedback history.</p>'}</div>
-    </section><aside class="panel"><div class="panel-heading"><h2>Notifications</h2><button class="text-button" id="enable-alerts">Enable browser alerts</button></div>
-      <div class="notification-list">${state.notifications.length ? state.notifications.map(item => `<article><b>${escapeHtml(item.title)}</b><p>${escapeHtml(item.body)}</p><small>${new Date(item.createdAt).toLocaleString()}</small></article>`).join('') : '<p class="empty-state">No notifications yet.</p>'}</div></aside></div>`);
+    </section><details class="notification-drawer"><summary>Recent updates (${state.notifications.length})</summary><div class="notification-drawer-actions"><button class="text-button" id="enable-alerts">Enable browser alerts</button></div><div class="notification-list">${state.notifications.length ? state.notifications.map(item => `<article><b>${escapeHtml(item.title)}</b><p>${escapeHtml(item.body)}</p><small>${new Date(item.createdAt).toLocaleString()}</small></article>`).join('') : '<p class="empty-state">No updates yet.</p>'}</div></details></section>`);
   bindRoutes();
   root.querySelector('#enable-alerts').onclick = async () => {
     if (!('Notification' in window)) return toast('Browser notifications are not supported here.');
@@ -714,7 +635,7 @@ function activity() {
 
 function downloadSummary(item) {
   const feedbackData = item.feedbackReceived;
-  const text = ['MOCKSYRA SESSION SUMMARY', `Peer: ${item.peer.name}`, `Mode: ${modes[normalizedMode(item.practiceMode)]?.title || item.practiceMode || 'Peer Practice'}`, `Type: ${item.interviewType}`, `Time: ${formatSlot(item.sharedSlot)}`, '', 'WHAT WENT WELL', feedbackData?.strength || 'Feedback pending', '', 'FOCUS FOR NEXT TIME', feedbackData?.improve || 'Feedback pending'].join('\n');
+  const text = ['MOCKSYRA SESSION SUMMARY', `Partner: ${item.peer.name}`, `Role: ${modes[normalizedMode(item.practiceMode)]?.title || 'Candidate'}`, `Type: ${item.interviewType}`, `Time: ${formatSlot(item.sharedSlot)}`, '', 'WHAT WENT WELL', feedbackData?.strength || 'Feedback pending', '', 'FOCUS FOR NEXT TIME', feedbackData?.improve || 'Feedback pending'].join('\n');
   const link = document.createElement('a'); link.href = URL.createObjectURL(new Blob([text], { type: 'text/plain' }));
   link.download = `mocksyra-${new Date(item.completedAt || Date.now()).toISOString().slice(0, 10)}.txt`; link.click(); URL.revokeObjectURL(link.href);
 }
@@ -731,10 +652,17 @@ function clearActiveMatch() {
 }
 
 socket.on('connect', () => socket.emit('restore-profile'));
-socket.on('match-waiting', () => toast('You are in the queue. We will notify you when a compatible peer is found.'));
+socket.on('match-waiting', () => toast('Your availability is live. We will notify you when an interview is booked.'));
 socket.on('match-found', matchData => {
   state.match = matchData; state.roomId = matchData.roomId; localStorage.setItem('mocksyra-active-match', JSON.stringify(matchData));
-  if (['#search', '#marketplace', '#onboarding'].includes(location.hash)) go('match'); else showSystemNotification({ title: 'Your Mocksyra match is ready', body: `You matched with ${matchData.peer.name}.` });
+  if (location.hash === '#marketplace') marketplace();
+  else if (['#search', '#onboarding'].includes(location.hash)) go('match');
+  else showSystemNotification({ title: 'Your Mocksyra match is ready', body: `You matched with ${matchData.peer.name}.` });
+});
+socket.on('match-cancelled', packet => {
+  if (!packet?.roomId || packet.roomId === state.roomId) clearActiveMatch();
+  toast(packet?.message || 'This interview was cancelled.');
+  if (!['#home', '#auth'].includes(location.hash)) go('marketplace');
 });
 socket.on('profile-state', restored => {
   if (restored?.profile) { state.profile = { ...state.profile, ...restored.profile }; localStorage.setItem(PROFILE_KEY, JSON.stringify(state.profile)); }
@@ -742,45 +670,36 @@ socket.on('profile-state', restored => {
   else if (restored && Object.hasOwn(restored, 'activeMatch') && state.match && location.hash !== '#feedback') clearActiveMatch();
   if (Array.isArray(restored?.history)) state.history = restored.history;
   if (Array.isArray(restored?.notifications)) state.notifications = restored.notifications;
+  if (location.hash === '#marketplace' && restored && Object.hasOwn(restored, 'activeMatch')) marketplace();
 });
 socket.on('session-listings', listings => { state.listings = listings || []; if (location.hash === '#marketplace') renderMarketplaceResults(); });
 socket.on('listings-updated', () => { if (location.hash === '#marketplace') refreshMarketplace(false); });
 socket.on('notifications', notifications => { state.notifications = notifications || []; if (location.hash === '#activity') activity(); });
 socket.on('notification', notification => { state.notifications = [notification, ...state.notifications.filter(item => item.id !== notification.id)]; showSystemNotification(notification); if (location.hash === '#activity') activity(); });
 socket.on('history', history => { state.history = history || []; if (location.hash === '#activity') activity(); });
-socket.on('peer-entered-room', () => { toast('Your peer entered the room.'); const button = root.querySelector('#join'); if (button) { button.innerHTML = 'Peer is ready — join now <b>→</b>'; button.classList.add('button-light'); } });
+socket.on('peer-entered-room', () => { toast('Your interview partner entered the room.'); const button = root.querySelector('#join'); if (button) { button.textContent = 'Partner is ready — join now'; button.classList.add('button-light'); } });
 socket.on('session-ready', async packet => {
   if (packet.startedAt) startSyncedTimer(packet.startedAt);
   if (state.match?.videoProvider === 'daily') { const status = root.querySelector('#daily-status'); if (status) { status.textContent = 'Both participants are here. Your session has started.'; status.classList.add('ready'); } return; }
   if (!state.pc) return;
   if (state.match?.startsAsInterviewer && !state.offerStarted) { state.offerStarted = true; const offer = await state.pc.createOffer(); await state.pc.setLocalDescription(offer); socket.emit('signal', { roomId: state.roomId, data: { offer } }); }
-  updateConnection('Peer joined — establishing secure connection…', false);
-});
-socket.on('session-phase', packet => {
-  state.match = { ...state.match, ...packet, question: packet.question || state.match?.question };
-  localStorage.setItem('mocksyra-active-match', JSON.stringify(state.match));
-  root.querySelector('#agenda-one')?.classList.toggle('active', packet.phase !== 2);
-  root.querySelector('#agenda-two')?.classList.toggle('active', packet.phase === 2);
-  const question = packet.question || {}, title = root.querySelector('#question-title'), brief = root.querySelector('#question-brief');
-  if (title) title.textContent = question.title || 'Collaborative workspace';
-  if (brief) brief.innerHTML = `<b>Interview question</b><p>${escapeHtml(question.prompt || 'Use the shared pad to work through your interview question.')}</p>${question.hints?.length ? `<details><summary>Hints for the interviewer</summary><ul>${question.hints.map(hint => `<li>${escapeHtml(hint)}</li>`).join('')}</ul></details>` : ''}`;
-  toast(`Roles switched — you are now the ${packet.role}.`, 5000);
+  updateConnection('Partner joined — establishing secure connection…', false);
 });
 socket.on('signal', handleSignal);
 socket.on('workspace-state', workspace => {
   state.workspace = workspace || state.workspace; const editor = root.querySelector('#shared-code'), language = root.querySelector('#code-language');
   if (editor && document.activeElement !== editor) editor.value = state.workspace.code || ''; if (language) language.value = state.workspace.language || 'JavaScript';
-  const status = root.querySelector('#sync-status'); if (status) status.textContent = 'Synced with your peer';
+  const status = root.querySelector('#sync-status'); if (status) status.textContent = 'Synced with your partner';
 });
-socket.on('workspace-update', workspace => { state.workspace = workspace; const editor = root.querySelector('#shared-code'); if (editor && document.activeElement !== editor) editor.value = workspace.code; const status = root.querySelector('#sync-status'); if (status) status.textContent = 'Peer updated the workspace'; });
+socket.on('workspace-update', workspace => { state.workspace = workspace; const editor = root.querySelector('#shared-code'); if (editor && document.activeElement !== editor) editor.value = workspace.code; const status = root.querySelector('#sync-status'); if (status) status.textContent = 'Partner updated the workspace'; });
 socket.on('chat-state', messages => { state.chat = messages || []; renderChat(); });
 socket.on('chat-message', message => { state.chat.push(message); renderChat(); });
-socket.on('peer-left', () => updateConnection('Your peer left the room. They can rejoin.', false));
+socket.on('peer-left', () => updateConnection('Your partner left the room. They can rejoin.', false));
 socket.on('session-ended', () => { endLocalCall(); go('feedback'); });
 socket.on('peer-feedback-submitted', () => {
   const button = root.querySelector('#submit');
-  if (button?.disabled) button.textContent = 'Peer submitted — finalizing feedback…';
-  else toast('Your peer has submitted feedback. Complete yours when ready.');
+  if (button?.disabled) button.textContent = 'Partner submitted — finalizing feedback…';
+  else toast('Your partner has submitted feedback. Complete yours when ready.');
 });
 socket.on('feedback-ready', feedbackData => {
   state.feedback = feedbackData;
@@ -794,7 +713,7 @@ socket.on('connect_error', error => { if (error.message === 'Authentication requ
 async function logout() {
   endLocalCall(); socket.disconnect(); await window.peerSupabase.auth.signOut();
   localStorage.removeItem(EMAIL_KEY); localStorage.removeItem(PROFILE_KEY); localStorage.removeItem('mocksyra-active-match');
-  state.profile = null; state.match = null; state.history = []; state.notifications = []; go('home'); toast('You have been logged out.');
+  state.profile = null; state.authUser = null; state.match = null; state.history = []; state.notifications = []; go('home'); toast('You have been logged out.');
 }
 document.addEventListener('click', event => { if (event.target.closest('#logout')) logout(); });
 
@@ -816,10 +735,12 @@ async function restoreAuthentication() {
   try {
     const { data } = await window.peerSupabase.auth.getSession();
     const user = data.session?.user;
-    if (user?.email && (!state.authenticated || localStorage.getItem(EMAIL_KEY) !== user.email)) {
+    if (user?.email) {
+      state.authUser = user;
       state.authenticated = true;
       localStorage.setItem(EMAIL_KEY, user.email);
-      router();
+      if (location.hash === '#auth') go('marketplace');
+      else router();
     }
   } catch {
     /* Keep the current view usable if Supabase is temporarily unavailable. */

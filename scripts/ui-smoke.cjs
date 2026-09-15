@@ -20,14 +20,14 @@ catch { playwright = createRequire(path.join(process.env.MOCKSYRA_PLAYWRIGHT_RUN
 function fakeSupabaseSDK() {
   window.supabase = {
     createClient() {
-      const user = { id: '00000000-0000-4000-8000-000000000001', email: 'fixture@example.test' };
+      const user = { id: '00000000-0000-4000-8000-000000000001', email: 'fixture@example.test', user_metadata: { full_name: 'Alex Morgan' } };
       const session = () => localStorage.getItem('mocksyra-email') ? { user, access_token: 'local-fixture-token' } : null;
       return {
         auth: {
           getSession: async () => ({ data: { session: session() }, error: null }),
           getUser: async () => ({ data: { user: session() ? user : null }, error: null }),
           signInWithPassword: async ({ email }) => ({ data: { session: { user: { ...user, email }, access_token: 'local-fixture-token' } }, error: null }),
-          signInWithOAuth: async () => ({ data: { provider: 'google' }, error: null }),
+          signInWithOAuth: async options => { window.__oauthOptions = options; return { data: { provider: 'google' }, error: null }; },
           signUp: async () => ({ data: { session: null }, error: null }),
           signOut: async () => ({ error: null }),
           onAuthStateChange: () => ({ data: { subscription: { unsubscribe() {} } } })
@@ -59,15 +59,18 @@ function fakeSocketSDK() {
           return socket;
         }
         if (event === 'browse-listings') {
-          const ownMode = socket.profile?.practiceMode || 'candidate';
-          const otherMode = ownMode === 'candidate' ? 'interviewer' : ownMode === 'interviewer' ? 'candidate' : 'peer';
-          const listing = { listingId: `fixture-${otherMode}-listing`, name: 'Maya Sharma', experience: 'Intermediate', languages: ['Python', 'AWS'], sessionsCompleted: 4, practiceMode: otherMode, interviewType: 'System Design', spokenLanguage: 'English', timezone: 'Asia/Kolkata', slots: [new Date(Date.now() + 5 * 60 * 1000).toISOString()] };
-          if (typeof ack === 'function') ack({ ok: true, listings: [listing], serverNow: new Date().toISOString() });
+          const slot = new Date(Date.now() + 5 * 60 * 1000).toISOString();
+          const listings = [
+            { listingId: 'fixture-interviewer-listing', name: 'Maya Sharma', experience: 'Intermediate', languages: ['Python', 'AWS'], sessionsCompleted: 4, practiceMode: 'interviewer', requiredRole: 'candidate', interviewType: 'System Design', spokenLanguage: 'English', timezone: 'Asia/Kolkata', slots: [slot] },
+            { listingId: 'fixture-candidate-listing', name: 'Ravi Mehta', experience: 'Beginner', languages: ['JavaScript', 'React'], sessionsCompleted: 2, practiceMode: 'candidate', requiredRole: 'interviewer', interviewType: 'Frontend', spokenLanguage: 'English + Hindi', timezone: 'Asia/Kolkata', slots: [new Date(Date.now() + 10 * 60 * 1000).toISOString()] }
+          ];
+          if (typeof ack === 'function') ack({ ok: true, listings, serverNow: new Date().toISOString() });
           return socket;
         }
         if (event === 'book-listing') {
-          const practiceMode = socket.profile?.practiceMode || 'candidate', directed = practiceMode !== 'peer';
-          const now = Date.now(), activeMatch = { roomId: `fixture-${practiceMode}-123456`, peer: { name: 'Maya Sharma', experience: 'Intermediate', languages: ['Python', 'AWS'], sessionsCompleted: 4 }, practiceMode, sessionMode: directed ? 'directed' : 'peer', peerRole: practiceMode === 'candidate' ? 'interviewer' : practiceMode === 'interviewer' ? 'candidate' : 'peer', durationMinutes: 45, startsAsInterviewer: practiceMode === 'interviewer', initiator: false, score: null, source: 'marketplace', bookingType: 'marketplace', reasons: ['Session selected by you'], sharedSlot: new Date(now + 5 * 60 * 1000).toISOString(), opensAt: new Date(now - 5 * 60 * 1000).toISOString(), closesAt: new Date(now + 20 * 60 * 1000).toISOString(), serverNow: new Date(now).toISOString(), canJoinNow: true, videoProvider: window.__fixtureHostedVideo ? 'daily' : 'webrtc', interviewType: 'System Design', question: { title: 'Build a service', prompt: 'Explain and implement a reliable service.', ...(practiceMode === 'interviewer' ? { hints: ['Fixture interviewer-only hint'] } : {}) }, feedbackCriteria: practiceMode === 'candidate' ? ['Question clarity', 'Guidance', 'Professionalism'] : ['Problem solving', 'Communication', 'Technical depth'], feedbackSubmitted: false, selfFeedback: null, status: 'matched' };
+          const practiceMode = payload.profile?.practiceMode || 'candidate';
+          socket.profile = { ...payload.profile, status: 'matched' };
+          const now = Date.now(), activeMatch = { roomId: `fixture-${practiceMode}-123456`, peer: { name: 'Maya Sharma', experience: 'Intermediate', languages: ['Python', 'AWS'], sessionsCompleted: 4 }, practiceMode, sessionMode: 'directed', peerRole: practiceMode === 'candidate' ? 'interviewer' : 'candidate', durationMinutes: 45, startsAsInterviewer: practiceMode === 'interviewer', initiator: false, score: null, source: 'marketplace', bookingType: 'marketplace', reasons: ['Session selected by you'], sharedSlot: new Date(now + 5 * 60 * 1000).toISOString(), opensAt: new Date(now - 5 * 60 * 1000).toISOString(), closesAt: new Date(now + 20 * 60 * 1000).toISOString(), serverNow: new Date(now).toISOString(), canJoinNow: true, videoProvider: window.__fixtureHostedVideo ? 'daily' : 'webrtc', interviewType: 'System Design', question: { title: 'Build a service', prompt: 'Explain and implement a reliable service.', ...(practiceMode === 'interviewer' ? { hints: ['Fixture interviewer-only hint'] } : {}) }, feedbackCriteria: practiceMode === 'candidate' ? ['Question clarity', 'Guidance', 'Professionalism'] : ['Problem solving', 'Communication', 'Technical depth'], feedbackSubmitted: false, selfFeedback: null, status: 'matched' };
           if (typeof ack === 'function') ack({ ok: true, activeMatch });
           return socket;
         }
@@ -129,13 +132,12 @@ function isolateDevices() {
 }
 
 function fixtureMatch(practiceMode) {
-  const directed = practiceMode !== 'peer';
   return {
     roomId: `fixture-${practiceMode}-123456`,
     peer: { name: 'Maya Sharma', experience: 'Intermediate', languages: ['JavaScript', 'React'], sessionsCompleted: 4 },
     practiceMode,
-    sessionMode: directed ? 'directed' : 'peer',
-    peerRole: practiceMode === 'candidate' ? 'interviewer' : practiceMode === 'interviewer' ? 'candidate' : 'peer',
+    sessionMode: 'directed',
+    peerRole: practiceMode === 'candidate' ? 'interviewer' : 'candidate',
     durationMinutes: 45,
     startsAsInterviewer: practiceMode === 'interviewer',
     initiator: false,
@@ -205,63 +207,85 @@ async function screenshot(page, name) {
 
 async function verifyGuest() {
   const page = await newPage(false);
-  await page.goto(origin); await page.locator('.hero').waitFor();
+  await page.goto(origin); await page.locator('.simple-hero').waitFor();
   assert.match(await page.title(), /Mocksyra/);
+  assert.equal(await page.getByText(/Peer Practice/i).count(), 0);
   await screenshot(page, 'landing-desktop'); await checkOverflow(page, 'landing desktop');
   await page.setViewportSize({ width: 390, height: 844 });
   await screenshot(page, 'landing-mobile'); await checkOverflow(page, 'landing mobile');
-  await page.locator('.hero [data-route="onboarding"]').first().click();
+  await page.setViewportSize({ width: 320, height: 720 }); await checkOverflow(page, 'landing small mobile');
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.locator('.simple-hero [data-route="marketplace"]').first().click();
   await page.locator('#auth-email').waitFor();
+  await screenshot(page, 'auth-mobile');
+  await checkOverflow(page, 'auth mobile');
+  await page.setViewportSize({ width: 320, height: 720 });
+  await checkOverflow(page, 'auth small mobile');
+  await page.setViewportSize({ width: 390, height: 844 });
   await page.locator('#auth-submit').click();
   assert.match(await page.locator('#auth-message').innerText(), /email|password/i);
   await page.locator('#sign-up-tab').click();
   assert.match(await page.locator('#auth-submit').innerText(), /create account/i);
   await page.locator('#sign-in-tab').click();
   assert.match(await page.locator('#google-sign-in').innerText(), /Google/);
+  await page.locator('#google-sign-in').click();
+  const redirectTo = await page.evaluate(() => window.__oauthOptions?.options?.redirectTo);
+  assert.equal(new URL(redirectTo).hash, '', 'Google uses a clean callback URL without a router hash');
   await page.locator('#auth-email').fill('fixture@example.test');
   await page.locator('#auth-password').fill('local-fixture-password');
   await page.locator('#auth-submit').click();
-  await page.locator('#name').waitFor();
-  report.checks.push('Guest landing CTA, auth validation/tabs and fixture sign-in');
+  await page.locator('#marketplace-results').waitFor();
+  await page.locator('.session-card').first().waitFor();
+  assert.equal(await page.locator('.session-card').count(), 2, 'a new account sees every open role without onboarding first');
+  await page.evaluate(match => window.__mocksyraSocket.receive('match-found', match), fixtureMatch('candidate'));
+  await page.locator('.upcoming-card').waitFor();
+  assert.match(await page.locator('.upcoming-card').innerText(), /Your next interview|Join now|View booking/i);
+  assert.equal(await page.locator('.session-card').count(), 2, 'open listings remain visible below an upcoming interview');
+  assert.equal(await page.locator('[data-book-listing]:disabled').count(), 2, 'a user cannot double-book while an interview is active');
+  await screenshot(page, 'sessions-upcoming-mobile');
+  report.checks.push('Simple auth, clean Google callback, all open listings and private upcoming interview card');
   await page.context().close();
 }
 
 async function verifyMode(practiceMode) {
   const page = await newPage();
   await page.goto(`${origin}/#onboarding`); await page.locator('#name').waitFor();
+  assert.equal(await page.locator('[data-mode="peer"]').count(), 0);
   await page.locator(`[data-mode="${practiceMode}"]`).click();
   assert.equal(await page.locator(`[data-mode="${practiceMode}"]`).getAttribute('aria-pressed'), 'true');
+  await page.locator('#name').fill('');
   await page.locator('#publish').click();
   assert.equal(await page.evaluate(() => window.__mocksyraSocket.sent.filter(item => item.event === 'publish-listing').length), 0, 'Incomplete preferences cannot publish');
   await page.locator('#name').fill('Alex Morgan');
   await page.locator('#interview-type').selectOption('Frontend');
-  await page.locator('#experience').selectOption('Intermediate');
-  await page.locator('#languages [data-value="JavaScript"]').click();
-  await page.locator('#languages [data-value="React"]').click();
-  await page.locator('#slots button').first().click();
+  await page.locator('#technology').selectOption('JavaScript');
   if (practiceMode === 'candidate') {
     await screenshot(page, 'onboarding-desktop');
     await page.setViewportSize({ width: 390, height: 844 });
     await checkOverflow(page, 'onboarding mobile'); await screenshot(page, 'onboarding-mobile');
+    await page.setViewportSize({ width: 320, height: 720 }); await checkOverflow(page, 'onboarding small mobile');
     await page.setViewportSize({ width: 1440, height: 1000 });
   }
   await page.locator('#publish').click();
   await page.waitForFunction(() => window.__mocksyraSocket.sent.some(item => item.event === 'publish-listing'));
   const submitted = await page.evaluate(() => window.__mocksyraSocket.sent.find(item => item.event === 'publish-listing').payload);
   assert.equal(submitted.practiceMode, practiceMode);
-  assert.deepEqual(submitted.languages, ['JavaScript', 'React']);
+  assert.deepEqual(submitted.languages, ['JavaScript']);
   assert.equal(submitted.slots.length, 1);
   await page.waitForURL('**/#marketplace');
-  await page.locator('.session-card').waitFor();
-  assert.match(await page.locator('.session-card').innerText(), /Python|AWS/);
+  await page.locator('.session-card').first().waitFor();
+  assert.match(await page.locator('#marketplace-results').innerText(), /Python|AWS/);
+  assert.match(await page.locator('#marketplace-results').innerText(), /Interviewer available/i);
+  assert.match(await page.locator('#marketplace-results').innerText(), /Candidate looking/i);
   assert.equal(await page.locator('.session-card').getByText(/Join room/i).count(), 0, 'public listing never exposes Join');
   if (practiceMode === 'candidate') {
     await screenshot(page, 'marketplace-desktop');
     await page.setViewportSize({ width: 390, height: 844 });
     await checkOverflow(page, 'marketplace mobile'); await screenshot(page, 'marketplace-mobile');
+    await page.setViewportSize({ width: 320, height: 720 }); await checkOverflow(page, 'marketplace small mobile');
     await page.setViewportSize({ width: 1440, height: 1000 });
   }
-  await page.locator('[data-book-listing]').first().click();
+  await page.locator(`[data-book-role="${practiceMode}"]`).first().click();
   const match = fixtureMatch(practiceMode); match.durationMinutes = 45;
   await page.locator('#join').waitFor();
   assert.match(await page.locator('#app').innerText(), new RegExp(`${match.durationMinutes}`));
@@ -293,6 +317,7 @@ async function verifyMode(practiceMode) {
     await screenshot(page, 'session-candidate-desktop');
     await page.setViewportSize({ width: 390, height: 844 });
     await checkOverflow(page, 'candidate session mobile'); await screenshot(page, 'session-candidate-mobile');
+    await page.setViewportSize({ width: 320, height: 720 }); await checkOverflow(page, 'candidate session small mobile');
     await page.setViewportSize({ width: 1440, height: 1000 });
   }
   await page.locator('[data-tab="workspace-panel"]').click();
@@ -303,17 +328,10 @@ async function verifyMode(practiceMode) {
   await page.locator('#run-code').click();
   await page.waitForFunction(() => document.querySelector('#code-output').textContent.trim() === '42');
   await page.waitForFunction(() => window.__mocksyraSocket.sent.some(item => item.event === 'workspace-update' && item.payload.code.includes('6 * 7')));
-  await page.locator('[data-tab="chat-panel"]').click();
-  await page.locator('#chat-input').fill('Can you explain the time complexity?');
-  await page.locator('#chat-input').press('Enter');
-  await page.getByText('Can you explain the time complexity?', { exact: true }).waitFor();
-  if (practiceMode === 'peer') {
-    await page.evaluate(packet => window.__mocksyraSocket.receive('session-phase', packet), { ...ready, phase: 2, role: 'interviewer', question: { ...match.question, hints: ['Second-round interviewer hint'] } });
-  }
   await page.locator('[data-tab="video-panel"]').click();
   await page.locator('#complete').click();
   await page.locator('#submit').waitFor();
-  const feedbackText = await page.locator('.feedback-grid').innerText();
+  const feedbackText = await page.locator('.feedback-card').innerText();
   if (practiceMode === 'candidate') assert.match(feedbackText, /Question clarity/i);
   else assert.match(feedbackText, /Problem solving/i);
   await page.locator('#submit').click();
@@ -324,7 +342,7 @@ async function verifyMode(practiceMode) {
   await page.locator('[data-repeat="yes"]').click();
   await page.locator('#submit').click();
   assert.equal(await page.evaluate(() => window.__mocksyraSocket.sent.filter(item => item.event === 'submit-feedback').length), 1);
-  report.checks.push(`${practiceMode}: publishes availability, sees complementary marketplace listings across technologies, books a private 45-minute session, then reaches calendar/session, device toggle, shared editor, chat and feedback`);
+  report.checks.push(`${practiceMode}: publishes availability, sees the complementary role, books a private 45-minute session, then reaches video, shared workspace and feedback`);
   await page.context().close();
 }
 
@@ -334,12 +352,10 @@ async function verifyHostedVideo() {
   await page.locator('[data-mode="candidate"]').click();
   await page.locator('#name').fill('Alex Morgan');
   await page.locator('#interview-type').selectOption('Frontend');
-  await page.locator('#experience').selectOption('Intermediate');
-  await page.locator('#languages [data-value="JavaScript"]').click();
-  await page.locator('#slots button').first().click();
+  await page.locator('#technology').selectOption('JavaScript');
   await page.locator('#publish').click();
-  await page.locator('.session-card').waitFor();
-  await page.locator('[data-book-listing]').first().click();
+  await page.locator('.session-card').first().waitFor();
+  await page.locator('[data-book-role="candidate"]').first().click();
   await page.locator('#join').click();
   await page.waitForFunction(() => Boolean(window.__dailyJoin));
   assert.equal(await page.evaluate(() => window.__dailyJoin.url), 'https://fixture.daily.test/private-room');
@@ -355,14 +371,14 @@ async function verifyHostedVideo() {
 async function verifyHistory() {
   const page = await newPage();
   await page.goto(`${origin}/#activity`);
-  await page.locator('.activity-metrics').waitFor();
-  const history = ['candidate', 'interviewer', 'peer'].map(mode => ({
+  await page.locator('.history-list').waitFor();
+  const history = ['candidate', 'interviewer'].map(mode => ({
     ...fixtureMatch(mode), completedAt: new Date().toISOString(),
     feedbackReceived: { scores: [4, 5, 4], strength: 'Clear reasoning.', improve: 'Practice edge cases.' }
   }));
   await page.evaluate(packet => window.__mocksyraSocket.receive('history', packet), history);
-  assert.equal(await page.locator('.history-card').count(), 3);
-  assert.match(await page.locator('.activity-metrics').innerText(), /135/);
+  assert.equal(await page.locator('.history-card').count(), 2);
+  assert.match(await page.locator('.activity-page').innerText(), /2 completed interviews/i);
   await page.setViewportSize({ width: 390, height: 844 });
   await checkOverflow(page, 'history mobile');
   await screenshot(page, 'history-mobile');
@@ -371,7 +387,7 @@ async function verifyHistory() {
   const summary = fs.readFileSync(await (await download).path(), 'utf8');
   assert.match(summary, /Clear reasoning\./);
   assert.match(summary, /candidate/i);
-  report.checks.push('History totals three 45-minute modes correctly and downloads candidate feedback');
+  report.checks.push('History totals candidate and interviewer sessions correctly and downloads candidate feedback');
   await page.context().close();
 }
 
@@ -381,7 +397,7 @@ async function verifyHistory() {
   origin = `http://127.0.0.1:${server.address().port}`;
   try {
     browser = await playwright.chromium.launch({ channel: process.env.MOCKSYRA_BROWSER_CHANNEL || 'chrome', headless: true });
-    for (const [name, run] of [['guest', verifyGuest], ...['candidate', 'interviewer', 'peer'].map(mode => [mode, () => verifyMode(mode)]), ['hosted-video', verifyHostedVideo], ['history', verifyHistory]]) {
+    for (const [name, run] of [['guest', verifyGuest], ...['candidate', 'interviewer'].map(mode => [mode, () => verifyMode(mode)]), ['hosted-video', verifyHostedVideo], ['history', verifyHistory]]) {
       try { await run(); process.stdout.write(`PASS ${name}\n`); }
       catch (error) { report.errors.push(`${name}: ${error.stack}`); process.stderr.write(`FAIL ${name}: ${error.message}\n`); }
     }

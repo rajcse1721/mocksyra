@@ -4,7 +4,7 @@ const { randomUUID } = require('crypto');
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
-const { PRACTICE_MODES, SESSION_DURATION_MS, PEER_SWITCH_MS, practiceMode, compatibleModes, sessionMode, sessionDetails, currentQuestion, isParticipant, canUseRoom, validFeedback, feedbackWithCriteria, finishFeedback } = require('./session-rules');
+const { PRACTICE_MODES, SESSION_DURATION_MS, practiceMode, compatibleModes, sessionDetails, currentQuestion, isParticipant, canUseRoom, validFeedback, feedbackWithCriteria, finishFeedback } = require('./session-rules');
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://qjghjsapizkqktcbczgj.supabase.co';
 const SUPABASE_PUBLISHABLE_KEY = process.env.SUPABASE_PUBLISHABLE_KEY || 'sb_publishable_LPppVZWRepW4yHykfUS2EQ_sH9dwksM';
@@ -30,6 +30,24 @@ let db = { profiles: {}, matches: {}, notifications: [] };
 try { db = { ...db, ...JSON.parse(fs.readFileSync(dbFile, 'utf8')) }; } catch {}
 
 let remoteSaveTimer;
+
+function migrateLegacyState() {
+  let changed = false;
+  Object.values(db.profiles || {}).forEach(profile => {
+    if (PRACTICE_MODES.includes(profile.practiceMode)) return;
+    profile.practiceMode = 'candidate';
+    if (profile.status === 'waiting') profile.status = 'idle';
+    changed = true;
+  });
+  Object.values(db.matches || {}).forEach(match => {
+    const legacyRoles = match.people?.some(person => !PRACTICE_MODES.includes(person.practiceMode));
+    if (!legacyRoles || !['matched', 'in_progress', 'feedback_pending'].includes(match.status)) return;
+    match.status = 'expired'; match.expiredAt = new Date().toISOString(); changed = true;
+    match.people.forEach(person => { if (db.profiles[person.email]?.status === 'matched') db.profiles[person.email].status = 'idle'; });
+  });
+  return changed;
+}
+
 function save() {
   fs.writeFileSync(dbFile, JSON.stringify(db, null, 2));
   if (!SUPABASE_SECRET_KEY) return;
@@ -145,14 +163,8 @@ function pruneQueue() {
   });
 }
 
-function listingRolesFor(mode) {
-  if (mode === 'candidate') return ['interviewer'];
-  if (mode === 'interviewer') return ['candidate'];
-  return ['peer'];
-}
-
 function waitingProfile(email, input) {
-  if (input?.practiceMode != null && !PRACTICE_MODES.includes(input.practiceMode)) return { error: 'Choose peer practice, candidate, or interviewer mode.' };
+  if (!PRACTICE_MODES.includes(input?.practiceMode)) return { error: 'Choose candidate or interviewer.' };
   const previous = db.profiles[email] || {};
   const profile = {
     email,
@@ -176,6 +188,7 @@ function waitingProfile(email, input) {
 }
 
 function publicListing(profile) {
+  const offeredRole = practiceMode(profile);
   return {
     listingId: profile.listingId,
     name: profile.name,
@@ -184,7 +197,8 @@ function publicListing(profile) {
     interviewType: profile.interviewType,
     experience: profile.experience,
     spokenLanguage: profile.spokenLanguage,
-    practiceMode: practiceMode(profile),
+    practiceMode: offeredRole,
+    requiredRole: offeredRole === 'candidate' ? 'interviewer' : 'candidate',
     timezone: profile.timezone,
     sessionsCompleted: Number(profile.stats?.sessionsCompleted) || 0,
     createdAt: profile.updatedAt
@@ -193,11 +207,8 @@ function publicListing(profile) {
 
 function listingsFor(email) {
   pruneQueue();
-  const viewer = db.profiles[email];
-  if (!viewer) return [];
-  const targetRoles = listingRolesFor(practiceMode(viewer));
   return Object.values(db.profiles)
-    .filter(profile => profile.email !== email && profile.status === 'waiting' && targetRoles.includes(practiceMode(profile)))
+    .filter(profile => profile.email !== email && profile.status === 'waiting' && PRACTICE_MODES.includes(practiceMode(profile)))
     .map(publicListing)
     .filter(listing => listing.slots.length)
     .sort((first, second) => Date.parse(first.slots[0]) - Date.parse(second.slots[0]));
@@ -219,7 +230,7 @@ function createMatch(first, second, options = {}) {
     listingId: options.listingId || null,
     scheduledStart: options.sharedSlot,
     mediaProvider: DAILY_API_KEY ? 'daily' : 'webrtc',
-    sessionMode: practiceMode(first) === 'peer' ? 'peer' : 'directed',
+    sessionMode: 'directed',
     durationMinutes: 45,
     status: 'matched',
     createdAt: new Date().toISOString(),
@@ -358,9 +369,6 @@ function scheduleSessionTimers(match) {
   const remaining = started + duration - Date.now();
   if (remaining <= 0) { finishSession(match); return; }
   const timers = [];
-  if (sessionMode(match) === 'peer' && started + PEER_SWITCH_MS > Date.now()) {
-    timers.push(setTimeout(() => { if (match.status === 'in_progress') emitSessionState(match, 'session-phase'); }, started + PEER_SWITCH_MS - Date.now()));
-  }
   timers.push(setTimeout(() => finishSession(match), remaining));
   timers.forEach(timer => timer.unref());
   sessionTimers.set(match.id, timers);
@@ -467,6 +475,7 @@ io.use(async (socket, next) => {
     if (!user.email) return next(new Error('Authentication required'));
     socket.data.email = user.email.toLowerCase();
     socket.data.userId = user.id;
+    socket.data.displayName = cleanText(user.user_metadata?.full_name || user.user_metadata?.name, 40);
     next();
   } catch { next(new Error('Authentication required')); }
 });
@@ -501,14 +510,27 @@ io.on('connection', socket => {
 
   socket.on('book-listing', (packet, callback) => {
     if (activeMatchFor(email)) return reject(socket, callback, 'You already have a booked session.');
-    const profile = db.profiles[email];
-    if (!profile || profile.status !== 'waiting') return reject(socket, callback, 'Publish your availability before booking a session.');
     const listingId = cleanText(packet?.listingId, 100);
     const target = Object.values(db.profiles).find(candidate => candidate.email !== email && candidate.listingId === listingId);
     if (!target || target.status !== 'waiting') return reject(socket, callback, 'That session was just booked or is no longer available. Refresh to see current sessions.');
-    if (!compatibleModes(profile, target)) return reject(socket, callback, 'Choose a complementary candidate or interviewer session.');
     const slot = cleanText(packet?.slot, 60);
     if (!slotsFor(target).includes(slot) || Date.parse(slot) <= Date.now()) return reject(socket, callback, 'That time is no longer available.');
+    const previous = db.profiles[email] || {};
+    const bookingProfile = packet?.profile || {};
+    const requiredRole = practiceMode(target) === 'candidate' ? 'interviewer' : 'candidate';
+    const prepared = waitingProfile(email, {
+      name: bookingProfile.name || previous.name || socket.data.displayName || email.split('@')[0].replace(/[._-]+/g, ' '),
+      languages: bookingProfile.languages?.length ? bookingProfile.languages : previous.languages?.length ? previous.languages : target.languages,
+      slots: [slot],
+      interviewType: target.interviewType,
+      experience: bookingProfile.experience || previous.experience || 'Beginner',
+      spokenLanguage: bookingProfile.spokenLanguage || previous.spokenLanguage || target.spokenLanguage || 'English',
+      practiceMode: requiredRole,
+      timezone: bookingProfile.timezone || previous.timezone || target.timezone || 'UTC'
+    });
+    if (prepared.error) return reject(socket, callback, prepared.error);
+    const profile = prepared.profile;
+    db.profiles[email] = profile;
     const match = createMatch(profile, target, {
       sharedSlot: new Date(slot).toISOString(),
       interviewType: target.interviewType,
@@ -518,7 +540,7 @@ io.on('connection', socket => {
       reasons: ['Session selected by you', `${target.interviewType} focus`, `${target.languages.join(', ')} practice`]
     });
     save();
-    acknowledge(callback, { ok: true, activeMatch: publicMatch(match, email) });
+    acknowledge(callback, { ok: true, profile: { ...profile }, activeMatch: publicMatch(match, email) });
     announceMatch(match);
   });
 
@@ -557,7 +579,7 @@ io.on('connection', socket => {
       if (db.profiles[person.email]?.status === 'matched') db.profiles[person.email].status = 'idle';
     });
     save();
-    match.people.forEach(person => emitToEmail(person.email, 'match-cancelled', { roomId, message: 'This match was cancelled. You can choose new preferences and find another match.' }));
+    match.people.forEach(person => emitToEmail(person.email, 'match-cancelled', { roomId, message: 'This interview was cancelled. You can book another open session.' }));
     io.emit('listings-updated');
     io.in(roomId).socketsLeave(roomId);
     acknowledge(callback, { ok: true });
@@ -690,6 +712,7 @@ app.get('*', (request, response) => {
 const port = process.env.PORT || 3000;
 async function start() {
   await loadRemoteState();
+  if (migrateLegacyState()) save();
   Object.values(db.matches).forEach(scheduleSessionTimers);
   return server.listen(port, () => console.log(`Mocksyra is running at http://localhost:${port}`));
 }
