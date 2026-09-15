@@ -87,7 +87,6 @@ function finishFeedback(match, profiles, now = Date.now()) {
     const sessionsCompleted = (Number(stats.sessionsCompleted) || 0) + 1;
     const ratingTotal = (Number(stats.ratingTotal) || 0) + average;
     profile.stats = { ...stats, sessionsCompleted, ratingTotal, averageRating: ratingTotal / sessionsCompleted };
-    profile.status = 'idle';
   });
   return true;
 }

@@ -13,6 +13,9 @@ const DAILY_API_KEY = process.env.DAILY_API_KEY || '';
 const APP_URL = process.env.APP_URL || 'http://localhost:3000';
 const JOIN_EARLY_MS = 10 * 60 * 1000;
 const JOIN_GRACE_MS = 15 * 60 * 1000;
+const SCHEDULE_BLOCK_MS = SESSION_DURATION_MS + JOIN_GRACE_MS;
+const MAX_OPEN_LISTINGS = 4;
+const MAX_UPCOMING_MATCHES = 4;
 const allowedOrigins = (process.env.FRONTEND_ORIGIN || '').split(',').map(origin => origin.trim()).filter(Boolean);
 
 const app = express();
@@ -26,24 +29,39 @@ const dataDir = path.join(__dirname, 'data');
 const dbFile = path.join(dataDir, 'mocksyra.json');
 fs.mkdirSync(dataDir, { recursive: true });
 
-let db = { profiles: {}, matches: {}, notifications: [] };
+let db = { profiles: {}, listings: {}, matches: {}, notifications: [] };
 try { db = { ...db, ...JSON.parse(fs.readFileSync(dbFile, 'utf8')) }; } catch {}
 
 let remoteSaveTimer;
 
 function migrateLegacyState() {
   let changed = false;
+  if (!db.listings || typeof db.listings !== 'object' || Array.isArray(db.listings)) { db.listings = {}; changed = true; }
   Object.values(db.profiles || {}).forEach(profile => {
-    if (PRACTICE_MODES.includes(profile.practiceMode)) return;
-    profile.practiceMode = 'candidate';
-    if (profile.status === 'waiting') profile.status = 'idle';
-    changed = true;
+    if (!profile || typeof profile !== 'object' || !profile.email) return;
+    if (!PRACTICE_MODES.includes(profile.practiceMode)) { profile.practiceMode = 'candidate'; changed = true; }
+    if (profile.status === 'waiting') {
+      const futureSlots = slotsFor(profile).filter(slot => Date.parse(slot) > Date.now()).slice(0, MAX_OPEN_LISTINGS);
+      futureSlots.forEach((slot, index) => {
+        const normalizedSlot = new Date(slot).toISOString();
+        const alreadyMigrated = Object.values(db.listings).some(listing => listing.email === profile.email && slotsFor(listing).some(existing => new Date(existing).toISOString() === normalizedSlot));
+        if (alreadyMigrated) return;
+        const legacyListingId = cleanText(profile.listingId, 100);
+        const listingId = index === 0 && legacyListingId && !db.listings[legacyListingId] ? legacyListingId : `listing-${randomUUID()}`;
+        db.listings[listingId] = { ...profile, listingId, slots: [normalizedSlot], status: 'waiting', createdAt: profile.updatedAt || new Date().toISOString() };
+      });
+      profile.status = 'idle';
+      changed = true;
+    } else if (profile.status !== 'idle') {
+      profile.status = 'idle';
+      changed = true;
+    }
+    if (Object.hasOwn(profile, 'listingId')) { delete profile.listingId; changed = true; }
   });
   Object.values(db.matches || {}).forEach(match => {
     const legacyRoles = match.people?.some(person => !PRACTICE_MODES.includes(person.practiceMode));
     if (!legacyRoles || !['matched', 'in_progress', 'feedback_pending'].includes(match.status)) return;
     match.status = 'expired'; match.expiredAt = new Date().toISOString(); changed = true;
-    match.people.forEach(person => { if (db.profiles[person.email]?.status === 'matched') db.profiles[person.email].status = 'idle'; });
   });
   return changed;
 }
@@ -78,7 +96,7 @@ async function loadRemoteState() {
     });
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const rows = await response.json();
-    if (rows[0]?.payload) db = { profiles: {}, matches: {}, notifications: [], ...rows[0].payload };
+    if (rows[0]?.payload) db = { profiles: {}, listings: {}, matches: {}, notifications: [], ...rows[0].payload };
   } catch (error) { console.error('Using local persistence:', error.message); }
 }
 
@@ -138,12 +156,46 @@ function cleanList(value, allowed, maximum = 12) {
   if (!Array.isArray(value)) return [];
   return [...new Set(value.map(item => cleanText(item, 50)).filter(item => !allowed || allowed.includes(item)))].slice(0, maximum);
 }
-function slotsFor(profile) { return cleanList(profile.slots?.length ? profile.slots : [profile.slot], null, 3).filter(slot => !Number.isNaN(new Date(slot).getTime())); }
+function slotsFor(profile) { return cleanList(profile.slots?.length ? profile.slots : [profile.slot], null, MAX_OPEN_LISTINGS).filter(slot => !Number.isNaN(new Date(slot).getTime())); }
 function sharedSlots(a, b) { const other = new Set(slotsFor(b)); return slotsFor(a).filter(slot => other.has(slot)).sort(); }
 function sharedSkills(a, b) { const other = new Set(b.languages || []); return (a.languages || []).filter(skill => other.has(skill)); }
-function activeMatchFor(email) {
+function actionableMatchesFor(email) {
   expireStaleMatches();
-  return Object.values(db.matches).find(match => ['matched', 'in_progress', 'feedback_pending'].includes(match.status) && match.people.some(person => person.email === email));
+  return Object.values(db.matches)
+    .filter(match => ['matched', 'in_progress', 'feedback_pending'].includes(match.status) && match.people.some(person => person.email === email))
+    .sort((first, second) => Date.parse(first.sharedSlot) - Date.parse(second.sharedSlot));
+}
+function upcomingMatchesFor(email) {
+  return actionableMatchesFor(email).filter(match => ['matched', 'in_progress'].includes(match.status));
+}
+function intervalsOverlap(firstSlot, secondSlot, duration = SCHEDULE_BLOCK_MS) {
+  const first = Date.parse(firstSlot), second = Date.parse(secondSlot);
+  return Number.isFinite(first) && Number.isFinite(second) && first < second + duration && second < first + duration;
+}
+function hasTimeConflict(email, slot) {
+  return upcomingMatchesFor(email).some(match => intervalsOverlap(match.sharedSlot, slot));
+}
+function inProgressMatchFor(email, exceptRoomId) {
+  return Object.values(db.matches).find(match => match.id !== exceptRoomId && match.status === 'in_progress' && match.people.some(person => person.email === email));
+}
+function hasBookingCapacity(email) {
+  return upcomingMatchesFor(email).length < MAX_UPCOMING_MATCHES;
+}
+function ownOpenListings(email) {
+  pruneQueue();
+  return Object.values(db.listings)
+    .filter(listing => listing.email === email && listing.status === 'waiting')
+    .sort((first, second) => Date.parse(slotsFor(first)[0]) - Date.parse(slotsFor(second)[0]));
+}
+function removeConflictingListings(email, slot) {
+  let changed = false;
+  Object.entries(db.listings).forEach(([listingId, listing]) => {
+    if (listing.email === email && listing.status === 'waiting' && intervalsOverlap(slotsFor(listing)[0], slot)) {
+      delete db.listings[listingId];
+      changed = true;
+    }
+  });
+  return changed;
 }
 function expireStaleMatches(now = Date.now()) {
   let changed = false;
@@ -152,15 +204,18 @@ function expireStaleMatches(now = Date.now()) {
     const start = Date.parse(match.sharedSlot);
     if (!Number.isFinite(start) || now <= start + JOIN_GRACE_MS) return;
     match.status = 'expired'; match.expiredAt = new Date(now).toISOString(); changed = true;
-    match.people.forEach(person => { if (db.profiles[person.email]?.status === 'matched') db.profiles[person.email].status = 'idle'; });
   });
   if (changed) { save(); io.emit('listings-updated'); }
 }
 function pruneQueue() {
-  const expiry = Date.now() - 90 * 60 * 1000;
-  Object.values(db.profiles).forEach(profile => {
-    if (profile.status === 'waiting' && !slotsFor(profile).some(slot => new Date(slot).getTime() > expiry)) profile.status = 'expired';
+  let changed = false;
+  Object.entries(db.listings || {}).forEach(([listingId, listing]) => {
+    if (listing.status !== 'waiting' || !slotsFor(listing).some(slot => Date.parse(slot) > Date.now())) {
+      delete db.listings[listingId];
+      changed = true;
+    }
   });
+  if (changed) save();
 }
 
 function waitingProfile(email, input) {
@@ -168,16 +223,15 @@ function waitingProfile(email, input) {
   const previous = db.profiles[email] || {};
   const profile = {
     email,
-    listingId: previous.status === 'waiting' && previous.listingId ? previous.listingId : `listing-${randomUUID()}`,
     name: cleanText(input?.name, 40),
     languages: cleanList(input?.languages, null, 12),
-    slots: cleanList(input?.slots, null, 3),
+    slots: cleanList(input?.slots, null, MAX_OPEN_LISTINGS),
     interviewType: questionBank[input?.interviewType] ? input.interviewType : '',
     experience: levels.includes(input?.experience) ? input.experience : 'Beginner',
     spokenLanguage: ['English', 'Hindi', 'English + Hindi'].includes(input?.spokenLanguage) ? input.spokenLanguage : 'English',
     practiceMode: practiceMode(input),
     timezone: cleanText(input?.timezone, 60),
-    status: 'waiting',
+    status: 'idle',
     stats: previous.stats || { sessionsCompleted: 0, ratingTotal: 0, averageRating: 0 },
     updatedAt: new Date().toISOString()
   };
@@ -185,6 +239,34 @@ function waitingProfile(email, input) {
   if (profile.slots.some(slot => !Number.isFinite(Date.parse(slot)) || Date.parse(slot) <= Date.now())) return { error: 'Choose an upcoming session time. Your previous time may have passed.' };
   profile.slots = [...new Set(profile.slots.map(slot => new Date(slot).toISOString()))].sort();
   return { profile };
+}
+
+function createListing(profile, slot) {
+  const listingId = `listing-${randomUUID()}`;
+  const listing = {
+    ...profile,
+    listingId,
+    slots: [new Date(slot).toISOString()],
+    status: 'waiting',
+    createdAt: new Date().toISOString()
+  };
+  db.listings[listingId] = listing;
+  return listing;
+}
+
+function validateOfferSlots(email, slots) {
+  const normalizedSlots = [...new Set((slots || []).map(slot => new Date(slot).toISOString()))].sort();
+  const existing = ownOpenListings(email);
+  if (existing.length + normalizedSlots.length > MAX_OPEN_LISTINGS) {
+    return { error: `You can publish up to ${MAX_OPEN_LISTINGS} open times. Cancel one before adding another.` };
+  }
+  for (let index = 0; index < normalizedSlots.length; index += 1) {
+    const slot = normalizedSlots[index];
+    if (hasTimeConflict(email, slot)) return { error: 'That time overlaps one of your booked interviews.' };
+    if (existing.some(listing => intervalsOverlap(slotsFor(listing)[0], slot))) return { error: 'That time overlaps one of your existing offers.' };
+    if (normalizedSlots.slice(0, index).some(other => intervalsOverlap(other, slot))) return { error: 'Choose times that do not overlap each other.' };
+  }
+  return { slots: normalizedSlots };
 }
 
 function publicListing(profile) {
@@ -201,14 +283,18 @@ function publicListing(profile) {
     requiredRole: offeredRole === 'candidate' ? 'interviewer' : 'candidate',
     timezone: profile.timezone,
     sessionsCompleted: Number(profile.stats?.sessionsCompleted) || 0,
-    createdAt: profile.updatedAt
+    createdAt: profile.createdAt || profile.updatedAt
   };
+}
+
+function ownListingsFor(email) {
+  return ownOpenListings(email).map(publicListing);
 }
 
 function listingsFor(email) {
   pruneQueue();
-  return Object.values(db.profiles)
-    .filter(profile => profile.email !== email && profile.status === 'waiting' && PRACTICE_MODES.includes(practiceMode(profile)))
+  return Object.values(db.listings)
+    .filter(profile => profile.email !== email && profile.status === 'waiting' && PRACTICE_MODES.includes(practiceMode(profile)) && hasBookingCapacity(profile.email))
     .map(publicListing)
     .filter(listing => listing.slots.length)
     .sort((first, second) => Date.parse(first.slots[0]) - Date.parse(second.slots[0]));
@@ -240,8 +326,6 @@ function createMatch(first, second, options = {}) {
     feedback: {}
   };
   db.matches[roomId] = match;
-  if (db.profiles[first.email]) db.profiles[first.email].status = 'matched';
-  if (db.profiles[second.email]) db.profiles[second.email].status = 'matched';
   return match;
 }
 
@@ -284,10 +368,11 @@ function compatibility(a, b) {
 function bestMatch(profile) {
   pruneQueue();
   let best;
-  for (const candidate of Object.values(db.profiles)) {
+  for (const candidate of Object.values(db.listings)) {
     if (candidate.email === profile.email || candidate.status !== 'waiting') continue;
     const result = compatibility(profile, candidate);
-    if (result && (!best || result.value > best.result.value)) best = { candidate, result };
+    if (!result || !hasBookingCapacity(candidate.email) || hasTimeConflict(profile.email, result.sharedSlot) || hasTimeConflict(candidate.email, result.sharedSlot)) continue;
+    if (!best || result.value > best.result.value) best = { candidate, result };
   }
   return best;
 }
@@ -332,13 +417,37 @@ function historyFor(email, matches = db.matches) {
 
 function profileStateFor(email) {
   const profile = db.profiles[email];
-  const active = activeMatchFor(email);
+  const activeMatches = actionableMatchesFor(email).map(match => publicMatch(match, email));
+  const upcomingMatches = upcomingMatchesFor(email).map(match => publicMatch(match, email));
+  const ownListings = ownListingsFor(email);
+  const profilePayload = profile ? { ...profile, practiceMode: practiceMode(profile) } : null;
+  if (profilePayload && ownListings.length) {
+    profilePayload.status = 'waiting';
+    profilePayload.listingId = ownListings[0].listingId;
+  }
   return {
-    profile: profile ? { ...profile, practiceMode: practiceMode(profile) } : null,
-    activeMatch: active ? publicMatch(active, email) : null,
+    profile: profilePayload,
+    activeMatch: activeMatches[0] || null,
+    activeMatches,
+    upcomingMatches,
+    ownListings,
     history: historyFor(email),
     notifications: db.notifications.filter(item => item.email === email).slice(-20).reverse()
   };
+}
+
+function scheduleStateFor(email) {
+  const activeMatches = actionableMatchesFor(email).map(match => publicMatch(match, email));
+  return {
+    activeMatch: activeMatches[0] || null,
+    activeMatches,
+    upcomingMatches: upcomingMatchesFor(email).map(match => publicMatch(match, email)),
+    ownListings: ownListingsFor(email)
+  };
+}
+
+function emitScheduleState(email) {
+  emitToEmail(email, 'schedule-updated', scheduleStateFor(email));
 }
 
 function clearSessionTimers(roomId) {
@@ -356,7 +465,11 @@ function finishSession(match) {
   match.sessionEndedAt = new Date().toISOString();
   clearSessionTimers(match.id);
   save();
-  match.people.forEach(person => emitToEmail(person.email, 'session-ended', { roomId: match.id }));
+  match.people.forEach(person => {
+    emitToEmail(person.email, 'session-ended', { roomId: match.id });
+    emitScheduleState(person.email);
+  });
+  io.in(match.id).socketsLeave(match.id);
   return true;
 }
 
@@ -494,27 +607,48 @@ io.on('connection', socket => {
   });
 
   socket.on('publish-listing', (input, callback) => {
-    if (activeMatchFor(email)) return reject(socket, callback, 'You already have a booked session. Open it before publishing another time.');
+    if (!hasBookingCapacity(email)) return reject(socket, callback, `You can have up to ${MAX_UPCOMING_MATCHES} upcoming interviews. Cancel or complete one before offering another time.`);
     const result = waitingProfile(email, input);
     if (result.error) return reject(socket, callback, result.error);
+    const validation = validateOfferSlots(email, result.profile.slots);
+    if (validation.error) return reject(socket, callback, validation.error);
     db.profiles[email] = result.profile;
+    const listingsCreated = validation.slots.map(slot => createListing(result.profile, slot));
     save();
-    acknowledge(callback, { ok: true, profile: { ...result.profile }, listings: listingsFor(email), serverNow: new Date().toISOString() });
+    const schedule = scheduleStateFor(email);
+    acknowledge(callback, {
+      ok: true,
+      profile: { ...result.profile, status: 'waiting', listingId: listingsCreated[0].listingId },
+      listing: publicListing(listingsCreated[0]),
+      listingsCreated: listingsCreated.map(publicListing),
+      ...schedule,
+      listings: listingsFor(email),
+      serverNow: new Date().toISOString()
+    });
     socket.emit('session-listings', listingsFor(email));
+    emitScheduleState(email);
     io.emit('listings-updated');
   });
 
   socket.on('browse-listings', (_, callback) => {
-    acknowledge(callback, { ok: true, listings: listingsFor(email), serverNow: new Date().toISOString() });
+    acknowledge(callback, { ok: true, listings: listingsFor(email), ...scheduleStateFor(email), serverNow: new Date().toISOString() });
   });
 
   socket.on('book-listing', (packet, callback) => {
-    if (activeMatchFor(email)) return reject(socket, callback, 'You already have a booked session.');
+    if (!hasBookingCapacity(email)) return reject(socket, callback, `You can have up to ${MAX_UPCOMING_MATCHES} upcoming interviews.`);
+    pruneQueue();
     const listingId = cleanText(packet?.listingId, 100);
-    const target = Object.values(db.profiles).find(candidate => candidate.email !== email && candidate.listingId === listingId);
+    const target = db.listings[listingId];
+    if (target?.email === email) return reject(socket, callback, 'You cannot book your own offer.');
     if (!target || target.status !== 'waiting') return reject(socket, callback, 'That session was just booked or is no longer available. Refresh to see current sessions.');
-    const slot = cleanText(packet?.slot, 60);
-    if (!slotsFor(target).includes(slot) || Date.parse(slot) <= Date.now()) return reject(socket, callback, 'That time is no longer available.');
+    if (!hasBookingCapacity(target.email)) return reject(socket, callback, 'That person already has four upcoming interviews. Choose another open time.');
+    const requestedSlot = cleanText(packet?.slot, 60);
+    const targetSlot = slotsFor(target)[0];
+    const slotTime = Date.parse(requestedSlot);
+    if (!targetSlot || !Number.isFinite(slotTime) || slotTime !== Date.parse(targetSlot) || slotTime <= Date.now()) return reject(socket, callback, 'That time is no longer available.');
+    const slot = new Date(slotTime).toISOString();
+    if (hasTimeConflict(email, slot)) return reject(socket, callback, 'That time overlaps one of your booked interviews.');
+    if (hasTimeConflict(target.email, slot)) return reject(socket, callback, 'That person is no longer available at this time. Choose another session.');
     const previous = db.profiles[email] || {};
     const bookingProfile = packet?.profile || {};
     const requiredRole = practiceMode(target) === 'candidate' ? 'interviewer' : 'candidate';
@@ -532,40 +666,85 @@ io.on('connection', socket => {
     const profile = prepared.profile;
     db.profiles[email] = profile;
     const match = createMatch(profile, target, {
-      sharedSlot: new Date(slot).toISOString(),
+      sharedSlot: slot,
       interviewType: target.interviewType,
       bookingType: 'marketplace',
       listingId,
       score: null,
       reasons: ['Session selected by you', `${target.interviewType} focus`, `${target.languages.join(', ')} practice`]
     });
+    delete db.listings[listingId];
+    removeConflictingListings(email, slot);
+    removeConflictingListings(target.email, slot);
     save();
-    acknowledge(callback, { ok: true, profile: { ...profile }, activeMatch: publicMatch(match, email) });
+    acknowledge(callback, { ok: true, profile: { ...profile }, ...scheduleStateFor(email) });
     announceMatch(match);
+    match.people.forEach(person => emitScheduleState(person.email));
   });
 
   socket.on('find-match', (input, callback) => {
-    const active = activeMatchFor(email);
-    if (active) {
-      acknowledge(callback, { ok: true, activeMatch: publicMatch(active, email) });
-      return socket.emit('match-found', publicMatch(active, email));
-    }
-    const prepared = input?.name ? waitingProfile(email, input) : { profile: db.profiles[email] };
+    if (!hasBookingCapacity(email)) return reject(socket, callback, `You can have up to ${MAX_UPCOMING_MATCHES} upcoming interviews.`);
+    const previous = db.profiles[email];
+    const prepared = input?.name ? waitingProfile(email, input) : previous ? waitingProfile(email, { ...previous, slots: slotsFor(previous) }) : {};
     if (!prepared.profile || prepared.error) return reject(socket, callback, prepared.error || 'Publish your availability before asking for an automatic match.');
     const profile = prepared.profile;
     db.profiles[email] = profile;
     const found = bestMatch(profile);
-    if (!found) { save(); acknowledge(callback, { ok: true, waiting: true, profile }); socket.emit('match-waiting'); return io.emit('listings-updated'); }
-    const match = createMatch(profile, found.candidate, { sharedSlot: found.result.sharedSlot, score: found.result.value, reasons: found.result.reasons });
+    if (!found) {
+      const existingSlotTimes = new Set(ownOpenListings(email).map(listing => Date.parse(slotsFor(listing)[0])));
+      const newSlots = profile.slots.filter(slot => !existingSlotTimes.has(Date.parse(slot)));
+      if (!newSlots.length) {
+        const schedule = scheduleStateFor(email);
+        acknowledge(callback, { ok: true, waiting: true, profile, listingsCreated: [], ...schedule });
+        socket.emit('match-waiting');
+        return;
+      }
+      const validation = validateOfferSlots(email, newSlots);
+      if (validation.error) return reject(socket, callback, validation.error);
+      const listingsCreated = validation.slots.map(slot => createListing(profile, slot));
+      save();
+      const schedule = scheduleStateFor(email);
+      acknowledge(callback, { ok: true, waiting: true, profile, listing: publicListing(listingsCreated[0]), listingsCreated: listingsCreated.map(publicListing), ...schedule });
+      socket.emit('match-waiting');
+      emitScheduleState(email);
+      return io.emit('listings-updated');
+    }
+    const slot = new Date(found.result.sharedSlot).toISOString();
+    const match = createMatch(profile, found.candidate, { sharedSlot: slot, score: found.result.value, reasons: found.result.reasons, listingId: found.candidate.listingId });
+    delete db.listings[found.candidate.listingId];
+    removeConflictingListings(email, slot);
+    removeConflictingListings(found.candidate.email, slot);
     save();
-    acknowledge(callback, { ok: true, activeMatch: publicMatch(match, email) });
+    acknowledge(callback, { ok: true, profile: { ...profile }, ...scheduleStateFor(email) });
     announceMatch(match);
+    match.people.forEach(person => emitScheduleState(person.email));
   });
 
-  socket.on('cancel-search', callback => {
-    if (activeMatchFor(email)) return reject(socket, callback, 'A match is already ready. Open it to join or cancel.');
-    if (db.profiles[email]?.status === 'waiting') { db.profiles[email].status = 'idle'; save(); io.emit('listings-updated'); }
-    acknowledge(callback, { ok: true });
+  socket.on('cancel-search', (packet, callback) => {
+    if (typeof packet === 'function') { callback = packet; }
+    let changed = false;
+    Object.entries(db.listings).forEach(([listingId, listing]) => {
+      if (listing.email !== email) return;
+      delete db.listings[listingId];
+      changed = true;
+    });
+    if (changed) save();
+    const schedule = scheduleStateFor(email);
+    acknowledge(callback, { ok: true, ...schedule, listings: listingsFor(email) });
+    if (changed) { emitScheduleState(email); io.emit('listings-updated'); }
+  });
+
+  socket.on('cancel-listing', (listingIdValue, callback) => {
+    pruneQueue();
+    const listingId = cleanText(typeof listingIdValue === 'object' ? listingIdValue?.listingId : listingIdValue, 100);
+    const listing = db.listings[listingId];
+    if (!listing || listing.email !== email) return reject(socket, callback, 'That offer is no longer available.');
+    delete db.listings[listingId];
+    save();
+    const schedule = scheduleStateFor(email);
+    acknowledge(callback, { ok: true, cancelledListingId: listingId, ...schedule, listings: listingsFor(email) });
+    emitScheduleState(email);
+    io.emit('listings-updated');
   });
 
   socket.on('cancel-match', (roomIdValue, callback) => {
@@ -575,20 +754,22 @@ io.on('connection', socket => {
     match.status = 'cancelled';
     match.cancelledAt = new Date().toISOString();
     clearSessionTimers(roomId);
-    match.people.forEach(person => {
-      if (db.profiles[person.email]?.status === 'matched') db.profiles[person.email].status = 'idle';
-    });
     save();
-    match.people.forEach(person => emitToEmail(person.email, 'match-cancelled', { roomId, message: 'This interview was cancelled. You can book another open session.' }));
+    match.people.forEach(person => {
+      emitToEmail(person.email, 'match-cancelled', { roomId, message: 'This interview was cancelled. You can book another open session.' });
+      emitScheduleState(person.email);
+    });
     io.emit('listings-updated');
     io.in(roomId).socketsLeave(roomId);
-    acknowledge(callback, { ok: true });
+    acknowledge(callback, { ok: true, cancelledRoomId: roomId, ...scheduleStateFor(email) });
   });
 
   socket.on('prepare-call', async (packet, callback) => {
     const roomId = cleanText(typeof packet === 'object' ? packet?.roomId : packet, 100);
     const match = authorizedMatch(socket, roomId);
     if (!match || !['matched', 'in_progress'].includes(match.status)) return reject(socket, callback, 'This interview room is unavailable.');
+    const busyParticipant = match.people.find(person => inProgressMatchFor(person.email, roomId));
+    if (busyParticipant) return reject(socket, callback, busyParticipant.email === email ? 'Finish your current live interview before joining another room.' : 'Your interview partner is still in another live interview. Please wait and retry.');
     const window = joinWindow(match);
     if (!window.canJoinNow) return reject(socket, callback, `This room opens 10 minutes before the scheduled session.`, { code: 'TOO_EARLY', ...window });
     if (match.mediaProvider !== 'daily') return acknowledge(callback, { ok: true, provider: 'webrtc', ...window });
@@ -596,7 +777,16 @@ io.on('connection', socket => {
     try {
       const person = match.people.find(participant => participant.email === email);
       const access = await dailyAccessFor(match, person, socket.data.userId);
-      acknowledge(callback, { ok: true, ...access, ...window });
+      if (!socket.connected) return;
+      const currentMatch = authorizedMatch(socket, roomId);
+      if (currentMatch !== match || !['matched', 'in_progress'].includes(currentMatch?.status) || currentMatch.mediaProvider !== 'daily') {
+        return reject(socket, callback, 'This interview room is no longer available.');
+      }
+      const currentBusyParticipant = currentMatch.people.find(participant => inProgressMatchFor(participant.email, roomId));
+      if (currentBusyParticipant) return reject(socket, callback, currentBusyParticipant.email === email ? 'Finish your current live interview before joining another room.' : 'Your interview partner is still in another live interview. Please wait and retry.');
+      const currentWindow = joinWindow(currentMatch);
+      if (!currentWindow.canJoinNow) return reject(socket, callback, 'This interview room is no longer open.', { code: 'JOIN_WINDOW_CLOSED', ...currentWindow });
+      acknowledge(callback, { ok: true, ...access, ...currentWindow });
     } catch (error) {
       console.error('Daily call preparation failed:', error.message);
       reject(socket, callback, 'The hosted video room is temporarily unavailable. Please retry.', { code: 'VIDEO_SERVICE_UNAVAILABLE' });
@@ -606,12 +796,14 @@ io.on('connection', socket => {
   socket.on('join-session', (roomIdValue, callback) => {
     const roomId = cleanText(roomIdValue, 100), match = authorizedMatch(socket, roomId);
     if (!match || !['matched', 'in_progress'].includes(match.status)) return reject(socket, callback, 'This interview room is unavailable.');
+    const busyParticipant = match.people.find(person => inProgressMatchFor(person.email, roomId));
+    if (busyParticipant) return reject(socket, callback, busyParticipant.email === email ? 'Finish your current live interview before joining another room.' : 'Your interview partner is still in another live interview. Please wait and retry.');
     if (match.status === 'matched' && !joinWindow(match).canJoinNow) return reject(socket, callback, `This room opens 10 minutes before ${new Date(match.sharedSlot).toLocaleString('en', { timeZone: 'UTC' })} UTC.`);
     if (match.status === 'in_progress') scheduleSessionTimers(match);
     if (match.status !== 'matched' && match.status !== 'in_progress') return reject(socket, callback, 'This interview has ended. Please share your feedback.');
     socket.join(roomId);
     const peer = match.people.find(person => person.email !== email);
-    emitToEmail(peer.email, 'peer-entered-room');
+    emitToEmail(peer.email, 'peer-entered-room', { roomId });
     const participants = roomParticipantEmails(roomId);
     if (participants.size >= 2) {
       if (!match.sessionStartedAt) match.sessionStartedAt = new Date().toISOString();
@@ -626,29 +818,30 @@ io.on('connection', socket => {
     const roomId = cleanText(typeof roomIdValue === 'object' ? roomIdValue?.roomId : roomIdValue, 100);
     const match = authorizedMatch(socket, roomId);
     if (!match) return reject(socket, callback, 'This interview room is unavailable.');
+    const wasJoined = socket.rooms.has(roomId);
     socket.leave(roomId);
-    if (!roomParticipantEmails(roomId).has(email)) socket.to(roomId).emit('peer-left', { roomId });
+    if (wasJoined && !roomParticipantEmails(roomId).has(email)) socket.to(roomId).emit('peer-left', { roomId });
     acknowledge(callback, { ok: true });
   });
 
   socket.on('signal', packet => {
     const valid = validRoomPacket(socket, packet);
     if (!valid || !packet.data || typeof packet.data !== 'object') return;
-    socket.to(valid.roomId).emit('signal', packet.data);
+    socket.to(valid.roomId).emit('signal', { ...packet.data, roomId: valid.roomId });
   });
 
   socket.on('workspace-request', roomIdValue => {
     const roomId = cleanText(roomIdValue, 100), match = authorizedMatch(socket, roomId);
     if (!canUseRoom(match, email, socket.rooms.has(roomId))) return;
-    socket.emit('workspace-state', match.workspace || { code: '', language: 'JavaScript', version: 0 });
-    socket.emit('chat-state', match.chat || []);
+    socket.emit('workspace-state', { roomId, ...(match.workspace || { code: '', language: 'JavaScript', version: 0 }) });
+    socket.emit('chat-state', { roomId, messages: match.chat || [] });
   });
 
   socket.on('workspace-update', packet => {
     const valid = validRoomPacket(socket, packet); if (!valid) return;
     const workspace = valid.match.workspace || { version: 0 };
     valid.match.workspace = { code: String(packet.code || '').slice(0, 20_000), language: cleanText(packet.language, 30) || 'Plain text', version: Number(workspace.version || 0) + 1, updatedBy: email };
-    save(); io.to(valid.roomId).emit('workspace-update', valid.match.workspace);
+    save(); io.to(valid.roomId).emit('workspace-update', { roomId: valid.roomId, ...valid.match.workspace });
   });
 
   socket.on('chat-message', packet => {
@@ -656,7 +849,7 @@ io.on('connection', socket => {
     const message = cleanText(packet.message, 500); if (!message) return;
     const profile = valid.match.people.find(person => person.email === email);
     const item = { id: `chat-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, name: profile.name, message, createdAt: new Date().toISOString() };
-    valid.match.chat = [...(valid.match.chat || []), item].slice(-50); save(); io.to(valid.roomId).emit('chat-message', item);
+    valid.match.chat = [...(valid.match.chat || []), item].slice(-50); save(); io.to(valid.roomId).emit('chat-message', { roomId: valid.roomId, ...item });
   });
 
   socket.on('complete-session', (roomIdValue, callback) => {
@@ -678,14 +871,14 @@ io.on('connection', socket => {
     match.feedback = match.feedback || {};
     match.feedback[email] = feedback; save();
     const peer = match.people.find(person => person.email !== email);
-    emitToEmail(peer.email, 'peer-feedback-submitted');
+    emitToEmail(peer.email, 'peer-feedback-submitted', { roomId: match.id });
     const completed = finishFeedback(match, db.profiles);
     acknowledge(callback, { ok: true, submitted: true, completed, selfFeedback: feedback });
     if (!completed) return;
     save();
     match.people.forEach(person => {
       const other = match.people.find(candidate => candidate.email !== person.email);
-      emitToEmail(person.email, 'feedback-ready', feedbackWithCriteria(match, other.email));
+      emitToEmail(person.email, 'feedback-ready', { roomId: match.id, ...feedbackWithCriteria(match, other.email) });
       emitToEmail(person.email, 'history', historyFor(person.email));
       notify(person, 'Your interview feedback is ready', 'Both feedback forms are in. Open Mocksyra to review and download your feedback.', match.id);
     });

@@ -7,31 +7,49 @@ const socket = io((['localhost', '127.0.0.1'].includes(location.hostname) ? loca
 
 const PROFILE_KEY = 'mocksyra-profile';
 const EMAIL_KEY = 'mocksyra-email';
+const ACTIVE_MATCH_KEY = 'mocksyra-active-match';
+const ACTIVE_MATCHES_KEY = 'mocksyra-active-matches';
+const ACCOUNT_KEY = 'mocksyra-account-key';
+const MAX_UPCOMING_MATCHES = 4;
 const skills = window.MOCKSYRA_SITE?.technologies || ['JavaScript', 'TypeScript', 'Python', 'Java', 'C++', 'C#', 'Go', 'React', 'Node.js', 'Spring Boot', 'SQL', 'AWS'];
 const interviewTypes = ['Data Structures & Algorithms', 'Frontend', 'Backend', 'System Design', 'Behavioral', 'SQL'];
 
 const readJson = (key, fallback) => {
   try { return JSON.parse(localStorage.getItem(key)) || fallback; } catch { return fallback; }
 };
+const initialAuthUser = window.__mocksyraAuthUser || null;
+const initialAuthKey = initialAuthUser?.email ? `${initialAuthUser.id || 'email'}:${String(initialAuthUser.email).toLowerCase()}` : '';
+const initialStoredKey = localStorage.getItem(ACCOUNT_KEY) || '';
+const initialProfileEmail = String(readJson(PROFILE_KEY, null)?.email || '').toLowerCase();
+const previousAccountEmail = String(window.__mocksyraPreviousAccountEmail || '').toLowerCase();
+if (initialAuthKey && ((initialStoredKey && initialStoredKey !== initialAuthKey) || (initialProfileEmail && initialProfileEmail !== String(initialAuthUser.email).toLowerCase()) || (previousAccountEmail && previousAccountEmail !== String(initialAuthUser.email).toLowerCase()))) {
+  [PROFILE_KEY, ACTIVE_MATCH_KEY, ACTIVE_MATCHES_KEY].forEach(key => localStorage.removeItem(key));
+}
+delete window.__mocksyraPreviousAccountEmail;
 
 const state = {
   profile: readJson(PROFILE_KEY, null),
-  authUser: null,
-  match: null,
-  roomId: null,
+  authUser: initialAuthUser,
+  activeMatches: readJson(ACTIVE_MATCHES_KEY, []),
+  ownListings: [],
+  match: readJson(ACTIVE_MATCH_KEY, null),
+  roomId: readJson(ACTIVE_MATCH_KEY, null)?.roomId || null,
   notifications: [],
   history: [],
   listings: [],
   serverNow: null,
-  pendingCandidates: [],
   dailyCall: null,
+  liveRoomId: null,
+  callGeneration: 0,
   workspace: { code: '', language: 'JavaScript', version: 0 },
   chat: [],
   selectedMode: sessionStorage.getItem('mocksyra-mode') || null,
   activeRoute: '',
   authenticated: Boolean(localStorage.getItem(EMAIL_KEY)),
+  authResolved: Boolean(window.__mocksyraAuthUser),
   restored: false
 };
+if (!Array.isArray(state.activeMatches)) state.activeMatches = [];
 
 const escapeHtml = value => String(value ?? '').replace(/[&<>'"]/g, character => ({
   '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;'
@@ -53,14 +71,61 @@ const modes = {
   interviewer: { title: 'Interviewer', icon: 'briefcase', duration: 45, target: 'a candidate', description: 'Lead the interview and help a candidate improve.' }
 };
 const normalizedMode = value => modes[value] ? value : 'candidate';
-const currentDisplayName = () => {
-  const metadata = state.authUser?.user_metadata || {};
-  const emailName = (state.authUser?.email || localStorage.getItem(EMAIL_KEY) || '').split('@')[0].replace(/[._-]+/g, ' ');
-  return state.profile?.name || metadata.full_name || metadata.name || emailName || 'Your account';
+const titleCaseEmailName = email => String(email || '').split('@')[0].replace(/[._-]+/g, ' ').replace(/\b\w/g, letter => letter.toUpperCase()).trim();
+const safeAvatarUrl = value => {
+  try {
+    const url = new URL(String(value || ''));
+    return url.protocol === 'https:' ? url.href : '';
+  } catch { return ''; }
 };
+const accountIdentity = () => {
+  const user = state.authUser || {};
+  const metadata = user.user_metadata || {};
+  const google = (user.identities || []).find(identity => identity?.provider === 'google')?.identity_data || {};
+  const email = user.email || google.email || metadata.email || localStorage.getItem(EMAIL_KEY) || '';
+  const name = google.full_name || google.name || metadata.full_name || metadata.name || titleCaseEmailName(email) || 'Your account';
+  const avatarUrl = safeAvatarUrl(google.avatar_url || google.picture || metadata.avatar_url || metadata.picture);
+  return { name, email, avatarUrl, initials: name.split(/\s+/).filter(Boolean).slice(0, 2).map(part => part[0]).join('').toUpperCase() || 'Y' };
+};
+const authUserKey = user => user?.email ? `${user.id || 'email'}:${String(user.email).toLowerCase()}` : '';
+const bookingDisplayName = () => state.profile?.name || accountIdentity().name;
 const modeFor = () => modes[normalizedMode(state.match?.practiceMode || state.profile?.practiceMode)];
 const sessionMinutes = () => Number(state.match?.durationMinutes) || 45;
 const closedMatch = match => !match || ['completed', 'cancelled', 'expired'].includes(match.status);
+if (state.match && !closedMatch(state.match) && !state.activeMatches.some(item => item.roomId === state.match.roomId)) {
+  state.activeMatches.push(state.match);
+  localStorage.setItem(ACTIVE_MATCHES_KEY, JSON.stringify(state.activeMatches));
+}
+const confirmedMatches = () => state.activeMatches.filter(matchData => !closedMatch(matchData) && ['matched', 'in_progress'].includes(matchData.status));
+const persistMatches = () => localStorage.setItem(ACTIVE_MATCHES_KEY, JSON.stringify(state.activeMatches));
+const selectMatch = matchData => {
+  if (!matchData) return;
+  if (state.roomId !== matchData.roomId) {
+    endLocalCall();
+    state.workspace = { code: '', language: matchData.peer?.languages?.[0] || 'JavaScript', version: 0 };
+    state.chat = [];
+  }
+  state.match = matchData;
+  state.roomId = matchData.roomId;
+  localStorage.setItem(ACTIVE_MATCH_KEY, JSON.stringify(matchData));
+};
+const upsertMatch = matchData => {
+  if (!matchData?.roomId) return;
+  const index = state.activeMatches.findIndex(item => item.roomId === matchData.roomId);
+  if (index === -1) state.activeMatches.push(matchData);
+  else state.activeMatches[index] = { ...state.activeMatches[index], ...matchData };
+  state.activeMatches = state.activeMatches.filter(item => !closedMatch(item)).sort((a, b) => Date.parse(a.sharedSlot) - Date.parse(b.sharedSlot));
+  persistMatches();
+};
+const applyScheduleResponse = response => {
+  if (!response) return;
+  const returnedMatches = Array.isArray(response.activeMatches) ? response.activeMatches : Array.isArray(response.upcomingMatches) ? response.upcomingMatches : null;
+  if (returnedMatches) {
+    state.activeMatches = returnedMatches.filter(item => !closedMatch(item)).sort((a, b) => Date.parse(a.sharedSlot) - Date.parse(b.sharedSlot));
+    persistMatches();
+  } else if (response.activeMatch) upsertMatch(response.activeMatch);
+  if (Array.isArray(response.ownListings)) state.ownListings = response.ownListings;
+};
 const icon = name => {
   const paths = {
     user: '<circle cx="12" cy="8" r="4"/><path d="M4 21v-2a8 8 0 0 1 16 0v2"/>',
@@ -81,19 +146,20 @@ const icon = name => {
   return `<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${paths[name] || paths.check}</svg>`;
 };
 function frame(content) {
-  const name = currentDisplayName();
+  const account = accountIdentity();
   const unread = state.notifications.filter(item => !item.read).length;
   return `<div class="app-shell">
     <header class="app-nav"><div class="shell app-nav-main">
       <a class="brand" href="#home"><i>◒</i> Mocksyra</a>
       <nav class="app-sections" aria-label="Main"><button class="text-button" data-route="marketplace">Sessions</button><button class="nav-activity" data-route="activity">History${unread ? `<span>${unread}</span>` : ''}</button></nav>
       <nav class="profile-menu" aria-label="Account">
-        <span class="mini-avatar">${escapeHtml(name[0] || 'Y')}</span>
-        <span>${escapeHtml(name)}</span><button class="text-button" id="logout">Log out</button>
+        <span class="account-avatar">${account.avatarUrl ? `<img src="${escapeHtml(account.avatarUrl)}" alt="" referrerpolicy="no-referrer">` : ''}<span aria-hidden="true">${escapeHtml(account.initials)}</span></span>
+        <span class="account-copy"><b class="account-name">${escapeHtml(account.name)}</b>${account.email ? `<small class="account-email">${escapeHtml(account.email)}</small>` : ''}</span><button class="text-button" id="logout">Log out</button>
       </nav>
     </div></header><main class="app-main"><div class="shell">${content}</div></main></div>`;
 }
 function bindRoutes(scope = root) {
+  scope.querySelectorAll('.account-avatar img').forEach(image => { image.onerror = () => { image.hidden = true; }; });
   scope.querySelectorAll('[data-route]').forEach(element => {
     element.onclick = () => {
       if (element.dataset.mode) {
@@ -104,32 +170,191 @@ function bindRoutes(scope = root) {
     };
   });
 }
+function updateAccountHeader() {
+  const menu = root.querySelector('.profile-menu');
+  if (!menu) return;
+  const account = accountIdentity();
+  const name = menu.querySelector('.account-name'), email = menu.querySelector('.account-email'), avatar = menu.querySelector('.account-avatar');
+  if (name) name.textContent = account.name;
+  if (email) email.textContent = account.email;
+  if (!avatar) return;
+  const initials = avatar.querySelector('span');
+  if (initials) initials.textContent = account.initials;
+  let image = avatar.querySelector('img');
+  if (!account.avatarUrl) { image?.remove(); return; }
+  if (!image) {
+    image = document.createElement('img');
+    image.alt = '';
+    image.referrerPolicy = 'no-referrer';
+    avatar.prepend(image);
+  }
+  image.hidden = false;
+  image.onerror = () => { image.hidden = true; };
+  image.src = account.avatarUrl;
+}
+
 let connectionPromise;
-async function connectSocket() {
-  if (socket.connected) return true;
-  if (connectionPromise) return connectionPromise;
-  const { data } = await window.peerSupabase.auth.getSession();
-  if (!data.session) return false;
-  socket.auth = { accessToken: data.session.access_token };
-  connectionPromise = new Promise(resolve => {
-    const finish = success => {
-      clearTimeout(timeout);
-      socket.off('connect', onConnect); socket.off('connect_error', onError);
-      connectionPromise = null; resolve(success);
-    };
-    const onConnect = () => finish(true);
-    const onError = error => { toast(error.message === 'Authentication required' ? 'Please sign in again.' : 'Connection unavailable. Your preferences are saved; please retry.'); finish(false); };
-    const timeout = setTimeout(() => { toast('The server is taking a little longer. Please retry.'); finish(false); }, 95000);
-    socket.once('connect', onConnect); socket.once('connect_error', onError); socket.connect();
+let connectionPromiseKey = '';
+let connectionAttempt = 0;
+let connectedAuthKey = '';
+let cancelConnectionWait = null;
+let logoutInProgress = false;
+let authRecoveryPromise = null;
+let authRecoveryRetryToken = '';
+function cancelSocketConnection() {
+  connectionAttempt += 1;
+  const cancelPending = cancelConnectionWait;
+  cancelConnectionWait = null;
+  if (cancelPending) cancelPending();
+  const wasConnecting = Boolean(connectionPromise);
+  connectionPromise = null;
+  connectionPromiseKey = '';
+  connectedAuthKey = '';
+  socket.auth = {};
+  if (socket.connected || socket.active || wasConnecting) socket.disconnect();
+}
+function clearSupabaseStoredSession() {
+  const storageKey = window.peerSupabase?.auth?.storageKey || 'sb-qjghjsapizkqktcbczgj-auth-token';
+  for (const key of [...Array(localStorage.length)].map((_, index) => localStorage.key(index)).filter(Boolean)) {
+    if (key === storageKey || key.startsWith(`${storageKey}.`)) localStorage.removeItem(key);
+  }
+}
+function invalidateAuthentication(message = 'Your session has expired. Please sign in again.') {
+  authRecoveryRetryToken = '';
+  clearSupabaseStoredSession();
+  window.__mocksyraAuthUser = null;
+  window.__mocksyraAccessToken = '';
+  applyAuthenticatedUser(null, 'AUTH_FAILURE');
+  toast(message);
+}
+function invalidRefreshError(error) {
+  const status = Number(error?.status || error?.statusCode);
+  const message = String(error?.message || error || '').toLowerCase();
+  return [400, 401, 403].includes(status) || /invalid.*refresh|refresh.*token.*(?:missing|expired|invalid)|session.*(?:missing|expired|invalid)/.test(message);
+}
+function recoverSocketAuthentication() {
+  const expectedAuthKey = authUserKey(state.authUser);
+  const rejectedToken = String(socket.auth?.accessToken || window.__mocksyraAccessToken || '');
+  if (!expectedAuthKey) {
+    invalidateAuthentication();
+    return Promise.resolve(false);
+  }
+  if (authRecoveryRetryToken && rejectedToken === authRecoveryRetryToken) {
+    invalidateAuthentication('We could not verify the refreshed session. Please sign in again.');
+    return Promise.resolve(false);
+  }
+  if (authRecoveryPromise) return authRecoveryPromise;
+
+  const task = Promise.resolve().then(async () => {
+    cancelSocketConnection();
+    let result;
+    try {
+      result = await window.peerSupabase.auth.refreshSession();
+    } catch (error) {
+      result = { data: { session: null }, error };
+    }
+    if (authUserKey(state.authUser) !== expectedAuthKey) return false;
+    const session = result?.data?.session;
+    const refreshedToken = String(session?.access_token || '');
+    if (result?.error && !invalidRefreshError(result.error)) {
+      toast('We could not refresh your session. Check your connection and retry.');
+      return false;
+    }
+    if (result?.error || !session?.user || authUserKey(session.user) !== expectedAuthKey || !refreshedToken || refreshedToken === rejectedToken) {
+      invalidateAuthentication();
+      return false;
+    }
+    window.__mocksyraAuthUser = session.user;
+    window.__mocksyraAccessToken = refreshedToken;
+    socket.auth = { accessToken: refreshedToken };
+    applyAuthenticatedUser(session.user, 'TOKEN_REFRESHED');
+    if (authUserKey(state.authUser) !== expectedAuthKey) return false;
+    authRecoveryRetryToken = refreshedToken;
+    if (routeName() === 'auth') go('marketplace');
+    const connected = await connectSocket();
+    if (connected) authRecoveryRetryToken = '';
+    else if (authUserKey(state.authUser) === expectedAuthKey) authRecoveryRetryToken = '';
+    return connected;
   });
-  return connectionPromise;
+  authRecoveryPromise = task;
+  task.then(() => { if (authRecoveryPromise === task) authRecoveryPromise = null; }, () => { if (authRecoveryPromise === task) authRecoveryPromise = null; });
+  return task;
+}
+function connectSocket() {
+  const expectedAuthKey = authUserKey(state.authUser);
+  if (!expectedAuthKey) return Promise.resolve(false);
+  if (socket.connected && connectedAuthKey === expectedAuthKey) return Promise.resolve(true);
+  if (connectionPromise && connectionPromiseKey === expectedAuthKey) return connectionPromise;
+  if (connectionPromise || socket.connected || socket.active) cancelSocketConnection();
+
+  const attempt = ++connectionAttempt;
+  connectionPromiseKey = expectedAuthKey;
+  const task = (async () => {
+    let data;
+    try {
+      ({ data } = await window.peerSupabase.auth.getSession());
+    } catch {
+      if (attempt === connectionAttempt) toast('Could not verify your account. Please sign in again.');
+      return false;
+    }
+    const session = data?.session;
+    const sessionAuthKey = authUserKey(session?.user);
+    if (attempt !== connectionAttempt || sessionAuthKey !== expectedAuthKey || authUserKey(state.authUser) !== expectedAuthKey) return false;
+    socket.auth = { accessToken: session.access_token };
+    // Keep the verified identity authorized while Socket.IO performs its own
+    // transient reconnects. Account changes explicitly clear this key.
+    connectedAuthKey = expectedAuthKey;
+    return new Promise(resolve => {
+      let settled = false;
+      const finish = success => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        socket.off('connect', onConnect); socket.off('connect_error', onError);
+        if (cancelConnectionWait === cancel) cancelConnectionWait = null;
+        if (success && attempt === connectionAttempt && authUserKey(state.authUser) === expectedAuthKey) connectedAuthKey = expectedAuthKey;
+        resolve(success && attempt === connectionAttempt && authUserKey(state.authUser) === expectedAuthKey);
+      };
+      const cancel = () => finish(false);
+      const onConnect = () => finish(true);
+      const onError = error => {
+        if (attempt === connectionAttempt && error.message !== 'Authentication required') toast('Connection unavailable. Your preferences are saved; please retry.');
+        finish(false);
+      };
+      const timeout = setTimeout(() => {
+        if (attempt === connectionAttempt) toast('The server is taking a little longer. Please retry.');
+        finish(false);
+      }, 95000);
+      cancelConnectionWait = cancel;
+      socket.once('connect', onConnect); socket.once('connect_error', onError); socket.connect();
+    });
+  })();
+  connectionPromise = task;
+  task.then(() => {
+    if (connectionPromise === task) {
+      connectionPromise = null;
+      connectionPromiseKey = '';
+    }
+  });
+  return task;
 }
 window.connectMocksyraSocket = connectSocket;
 function request(event, payload, timeoutMs = 12000) {
   return new Promise(resolve => {
     if (!socket.connected) return resolve({ ok: false, error: 'You are offline. Please reconnect and try again.' });
-    const timeout = setTimeout(() => resolve({ ok: false, error: 'No response yet. Please try again.' }), timeoutMs);
-    socket.emit(event, payload, result => { clearTimeout(timeout); resolve(result || { ok: true }); });
+    const requestAttempt = connectionAttempt;
+    const requestAuthKey = connectedAuthKey;
+    const requestSocketId = socket.id;
+    let settled = false;
+    const finish = result => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      const stale = requestAttempt !== connectionAttempt || requestAuthKey !== connectedAuthKey || requestAuthKey !== authUserKey(state.authUser) || !socket.connected || socket.id !== requestSocketId;
+      resolve(stale ? { ok: false, stale: true, error: 'Your account changed before this request finished.' } : result || { ok: true });
+    };
+    const timeout = setTimeout(() => finish({ ok: false, error: 'No response yet. Please try again.' }), timeoutMs);
+    socket.emit(event, payload, finish);
   });
 }
 function home() {
@@ -144,50 +369,55 @@ function home() {
   });
 }
 
-function availableSlots() {
-  const now = new Date();
-  const slots = [];
-  for (let dayOffset = 0; dayOffset <= 1; dayOffset += 1) {
-    const date = new Date(now);
-    date.setDate(now.getDate() + dayOffset);
-    for (let hour = 8; hour <= 22; hour += 2) {
-      const start = new Date(date);
-      start.setHours(hour, 0, 0, 0);
-      if (start.getTime() < now.getTime() + 60 * 60 * 1000) continue;
-      slots.push({
-        value: start.toISOString(),
-        label: `${dayOffset === 0 ? 'Today' : 'Tomorrow'} · ${start.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`
-      });
-    }
-  }
-  return slots;
-}
+const padDatePart = value => String(value).padStart(2, '0');
+const localDateValue = value => {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '' : `${date.getFullYear()}-${padDatePart(date.getMonth() + 1)}-${padDatePart(date.getDate())}`;
+};
+const localTimeValue = value => {
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? '' : `${padDatePart(date.getHours())}:${padDatePart(date.getMinutes())}`;
+};
+const defaultAvailability = () => {
+  const date = new Date(Date.now() + 2 * 60 * 60 * 1000);
+  date.setMinutes(Math.ceil(date.getMinutes() / 30) * 30, 0, 0);
+  return date;
+};
+const availabilityIso = (dateValue, timeValue) => {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(dateValue) || !/^\d{2}:\d{2}$/.test(timeValue)) return '';
+  const date = new Date(`${dateValue}T${timeValue}:00`);
+  if (Number.isNaN(date.getTime()) || localDateValue(date) !== dateValue || localTimeValue(date) !== timeValue) return '';
+  return date.toISOString();
+};
 
 function onboarding() {
   const previous = state.profile || {};
   let selectedMode = normalizedMode(state.selectedMode || previous.practiceMode);
-  const slots = availableSlots();
   const previousSlot = (previous.slots || []).find(value => Date.parse(value) > Date.now());
-  if (previousSlot && !slots.some(slot => slot.value === previousSlot)) slots.unshift({ value: previousSlot, label: formatSlot(previousSlot) });
-  let selectedSlot = previousSlot || slots[0]?.value || '';
+  const selectedAvailability = previousSlot ? new Date(previousSlot) : defaultAvailability();
+  const minimumDate = localDateValue(new Date());
+  const maximumDate = new Date(); maximumDate.setDate(maximumDate.getDate() + 90);
   let selectedTechnology = previous.languages?.[0] || skills[0];
-  const currentMatch = !closedMatch(state.match);
+  const upcomingCount = confirmedMatches().length;
   root.innerHTML = frame(`<section class="simple-page onboarding-page">
     <header class="simple-page-heading"><p class="eyebrow">SET UP AN INTERVIEW</p><h1 class="page-title">Choose your role and time.</h1>
     <p class="page-subtitle">Every interview has one candidate and one interviewer. Sessions last 45 minutes.</p></header>
-    ${currentMatch ? '<div class="notice">You already have a session waiting. <button class="text-button" data-route="match">Open your booking →</button></div>' : ''}
+    ${upcomingCount ? `<div class="notice">You have ${upcomingCount} upcoming interview${upcomingCount === 1 ? '' : 's'}. You can add another non-overlapping time${upcomingCount >= MAX_UPCOMING_MATCHES ? ' after one is completed or cancelled' : ''}.</div>` : ''}
     <form id="preferences-form" class="panel onboarding-form clean-form">
       <fieldset class="role-fieldset"><legend class="field-label">I want to join as</legend><div class="role-selector" role="group" aria-label="Interview role">
         ${['candidate', 'interviewer'].map(key => `<button type="button" class="role-option ${selectedMode === key ? 'selected' : ''}" data-mode="${key}" aria-pressed="${selectedMode === key}">${icon(modes[key].icon)}<span><b>${modes[key].title}</b><small>${modes[key].description}</small></span></button>`).join('')}
       </div></fieldset><p class="role-help" id="role-help"></p>
       <div class="simple-form-grid">
-        <div><label class="field-label" for="name">Display name</label><input id="name" class="textarea input" maxlength="40" required autocomplete="nickname" value="${escapeHtml(previous.name || currentDisplayName())}" placeholder="Your name"></div>
+        <div><label class="field-label" for="name">Name shown to interview partners</label><input id="name" class="textarea input" maxlength="40" required autocomplete="nickname" value="${escapeHtml(previous.name || bookingDisplayName())}" placeholder="Your name"></div>
         <div><label class="field-label" for="interview-type">Interview focus</label><select id="interview-type" class="select">${interviewTypes.map(value => `<option ${value === previous.interviewType ? 'selected' : ''}>${escapeHtml(value)}</option>`).join('')}</select></div>
         <div><label class="field-label" for="technology">Technology</label><select id="technology" class="select">${skills.map(value => `<option ${value === selectedTechnology ? 'selected' : ''}>${escapeHtml(value)}</option>`).join('')}</select></div>
-        <div><label class="field-label" for="session-time">Available time</label><select id="session-time" class="select">${slots.map(slot => `<option value="${escapeHtml(slot.value)}" ${slot.value === selectedSlot ? 'selected' : ''}>${escapeHtml(slot.label)}</option>`).join('')}</select><small class="input-help">Shown in ${escapeHtml(Intl.DateTimeFormat().resolvedOptions().timeZone)}</small></div>
+        <div class="availability-block"><span class="field-label">Available date and time</span><div class="availability-fields">
+          <label class="availability-field"><span>Date</span><input id="session-date" class="textarea input" type="date" min="${minimumDate}" max="${localDateValue(maximumDate)}" value="${localDateValue(selectedAvailability)}" required></label>
+          <label class="availability-field"><span>Start time</span><input id="session-time" class="textarea input" type="time" step="900" value="${localTimeValue(selectedAvailability)}" required></label>
+        </div><small class="input-help">Your timezone: ${escapeHtml(Intl.DateTimeFormat().resolvedOptions().timeZone)}</small></div>
       </div>
       <p id="preference-error" class="form-error" role="alert"></p>
-      <div class="clean-form-actions"><span>Free · 45 minutes · Live video</span><button type="submit" class="button" id="publish" ${currentMatch ? 'disabled' : ''}><span id="publish-label"></span></button></div>
+      <div class="clean-form-actions"><span>Free · 45 minutes · Live video</span><button type="submit" class="button" id="publish" ${upcomingCount >= MAX_UPCOMING_MATCHES ? 'disabled' : ''}><span id="publish-label"></span></button></div>
     </form></section>`);
   bindRoutes();
   const updateRole = () => {
@@ -203,8 +433,10 @@ function onboarding() {
     event.preventDefault();
     const error = root.querySelector('#preference-error'), button = root.querySelector('#publish');
     const name = root.querySelector('#name').value.trim();
-    selectedTechnology = root.querySelector('#technology').value; selectedSlot = root.querySelector('#session-time').value;
+    selectedTechnology = root.querySelector('#technology').value;
+    const selectedSlot = availabilityIso(root.querySelector('#session-date').value, root.querySelector('#session-time').value);
     if (!name || !selectedTechnology || !selectedSlot) { error.textContent = 'Add your name, technology, and available time.'; return; }
+    if (Date.parse(selectedSlot) <= Date.now()) { error.textContent = 'Choose a date and time in the future.'; return; }
     state.profile = { ...previous, name, practiceMode: selectedMode, languages: [selectedTechnology], slots: [selectedSlot],
       interviewType: root.querySelector('#interview-type').value, experience: previous.experience || 'Beginner',
       spokenLanguage: previous.spokenLanguage || 'English', timezone: Intl.DateTimeFormat().resolvedOptions().timeZone };
@@ -217,9 +449,10 @@ function onboarding() {
     const result = await request('publish-listing', state.profile);
     if (!result.ok) { button.disabled = false; button.textContent = 'Try again'; error.textContent = result.error; return; }
     if (result.listings) state.listings = result.listings;
+    applyScheduleResponse(result);
     if (result.profile) { state.profile = { ...state.profile, ...result.profile }; localStorage.setItem(PROFILE_KEY, JSON.stringify(state.profile)); }
     if (result.serverNow) state.serverNow = result.serverNow;
-    if (result.activeMatch) { state.match = result.activeMatch; state.roomId = result.activeMatch.roomId; return go('match'); }
+    if (result.activeMatch) selectMatch(result.activeMatch);
     if (location.hash === '#onboarding') go('marketplace');
   };
   updateRole();
@@ -242,16 +475,24 @@ async function refreshMarketplace(showLoading = true) {
   const results = root.querySelector('#marketplace-results');
   if (showLoading && results) { results.setAttribute('aria-busy', 'true'); results.innerHTML = '<p class="empty-state">Refreshing available sessions…</p>'; }
   if (!(await connectSocket())) {
-    if (results) results.innerHTML = '<p class="empty-state" role="alert">Could not reach the session marketplace. Please try again.</p>';
+    if (results) {
+      results.setAttribute('aria-busy', 'false');
+      results.innerHTML = '<p class="empty-state" role="alert">Could not reach the session marketplace. Please try again.</p>';
+    }
     return;
   }
   const response = await request('browse-listings', {});
   if (!response.ok) {
-    if (results) results.innerHTML = `<p class="empty-state" role="alert">${escapeHtml(response.error)}</p>`;
+    if (results) {
+      results.setAttribute('aria-busy', 'false');
+      results.innerHTML = `<p class="empty-state" role="alert">${escapeHtml(response.error)}</p>`;
+    }
     return;
   }
   state.listings = response.listings || [];
+  applyScheduleResponse(response);
   state.serverNow = response.serverNow || state.serverNow;
+  renderYourSchedule();
   renderMarketplaceResults();
 }
 
@@ -267,14 +508,14 @@ function renderMarketplaceResults() {
     results.innerHTML = '<section class="marketplace-empty"><h2>No open sessions right now</h2><p>Add your availability below and another person can book it.</p></section>';
     return;
   }
-  const hasActiveMatch = !closedMatch(state.match);
+  const scheduleFull = confirmedMatches().length >= MAX_UPCOMING_MATCHES;
   results.innerHTML = sessions.map(listing => {
     const requiredRole = listing.requiredRole || (listing.practiceMode === 'candidate' ? 'interviewer' : 'candidate');
     const offer = listing.practiceMode === 'interviewer' ? 'Interviewer available' : 'Candidate looking for an interviewer';
     return `<article class="session-card" role="listitem" data-listing-id="${escapeHtml(listing.listingId)}">
     <header class="session-card-person"><span class="listing-avatar">${escapeHtml(listing.name?.[0] || '?')}</span><div><span class="session-role">${offer}</span><h2>${escapeHtml(listing.name)}</h2><p>${escapeHtml(listing.experience)} · ${escapeHtml(listing.spokenLanguage)}</p></div></header>
     <div class="session-card-main"><div><h3>${escapeHtml(listing.interviewType)}</h3><p>${escapeHtml((listing.languages || []).slice(0, 3).join(' · '))}</p></div><div class="session-card-time"><time datetime="${escapeHtml(listing.slot)}">${escapeHtml(formatSlot(listing.slot))}</time><span>45 minutes</span></div></div>
-    <div class="session-card-actions"><button class="button" data-book-listing="${escapeHtml(listing.listingId)}" data-book-role="${requiredRole}" data-slot="${escapeHtml(listing.slot)}" aria-label="Book with ${escapeHtml(listing.name)} as ${requiredRole}" ${hasActiveMatch ? 'disabled' : ''}>${hasActiveMatch ? 'You already have an interview' : `Book as ${modes[requiredRole].title}`}</button></div><p class="session-card-error" role="alert"></p>
+    <div class="session-card-actions"><button class="button" data-book-listing="${escapeHtml(listing.listingId)}" data-book-role="${requiredRole}" data-slot="${escapeHtml(listing.slot)}" aria-label="Book with ${escapeHtml(listing.name)} as ${requiredRole}" ${scheduleFull ? 'disabled' : ''}>${scheduleFull ? 'Schedule full' : `Book as ${modes[requiredRole].title}`}</button></div><p class="session-card-error" role="alert"></p>
   </article>`;
   }).join('');
   root.querySelectorAll('[data-book-listing]').forEach(button => button.onclick = () => bookMarketplaceSession(button));
@@ -287,7 +528,7 @@ async function bookMarketplaceSession(button) {
   const role = listing.requiredRole || (listing.practiceMode === 'candidate' ? 'interviewer' : 'candidate');
   const bookingProfile = {
     ...(state.profile || {}),
-    name: currentDisplayName(),
+    name: bookingDisplayName(),
     practiceMode: role,
     languages: state.profile?.languages?.length ? state.profile.languages : listing.languages,
     slots: [button.dataset.slot],
@@ -296,6 +537,7 @@ async function bookMarketplaceSession(button) {
     spokenLanguage: state.profile?.spokenLanguage || listing.spokenLanguage || 'English',
     timezone: Intl.DateTimeFormat().resolvedOptions().timeZone
   };
+  const previousRoomIds = new Set(state.activeMatches.map(item => item.roomId));
   button.disabled = true; button.setAttribute('aria-busy', 'true'); button.textContent = 'Reserving…'; error.textContent = '';
   const response = await request('book-listing', { listingId: button.dataset.bookListing, slot: button.dataset.slot, profile: bookingProfile });
   if (!response.ok) {
@@ -305,19 +547,76 @@ async function bookMarketplaceSession(button) {
   state.profile = { ...bookingProfile, ...(response.profile || {}) };
   localStorage.setItem(PROFILE_KEY, JSON.stringify(state.profile));
   saveProfileToSupabase(state.profile);
-  state.match = response.activeMatch; state.roomId = response.activeMatch.roomId;
-  localStorage.setItem('mocksyra-active-match', JSON.stringify(response.activeMatch));
-  go('match');
+  applyScheduleResponse(response);
+  const newMatch = state.activeMatches.find(item => !previousRoomIds.has(item.roomId)) || state.activeMatches.find(item => item.listingId === button.dataset.bookListing);
+  if ((!state.match || closedMatch(state.match)) && (newMatch || response.activeMatch)) selectMatch(newMatch || response.activeMatch);
+  toast('Interview booked. It is now in your schedule.');
+  await refreshMarketplace(false);
+}
+
+function renderYourSchedule() {
+  const upcoming = root.querySelector('#upcoming-schedule');
+  const offers = root.querySelector('#open-offers');
+  const summary = root.querySelector('#schedule-summary');
+  if (!upcoming || !offers) return;
+  const matches = state.activeMatches.filter(item => !closedMatch(item)).sort((a, b) => Date.parse(a.sharedSlot) - Date.parse(b.sharedSlot));
+  const listings = state.ownListings.flatMap(listing => {
+    const slots = listing.slots?.length ? listing.slots : listing.slot ? [listing.slot] : [];
+    return slots.map(slot => ({ ...listing, slot }));
+  }).sort((a, b) => Date.parse(a.slot) - Date.parse(b.slot));
+  if (summary) summary.textContent = `${matches.length} upcoming · ${listings.length} open ${listings.length === 1 ? 'time' : 'times'}`;
+  upcoming.innerHTML = matches.length ? matches.map(matchData => {
+    const role = modes[normalizedMode(matchData.practiceMode)].title;
+    const joinState = scheduledJoinState(matchData);
+    const action = matchData.status === 'feedback_pending' ? 'Complete feedback' : joinState.allowed ? 'Join now' : 'View booking';
+    return `<article class="schedule-card" data-room-id="${escapeHtml(matchData.roomId)}">
+      <div class="schedule-card-main"><div class="schedule-card-copy"><span class="match-badge">${escapeHtml(role)}</span><h3>${escapeHtml(matchData.interviewType)} with ${escapeHtml(matchData.peer?.name || 'your partner')}</h3><p>${escapeHtml((matchData.languages || []).join(' · ') || matchData.peer?.languages?.join(' · ') || 'Interview session')}</p></div><div class="schedule-card-meta"><time datetime="${escapeHtml(matchData.sharedSlot)}">${escapeHtml(formatSlot(matchData.sharedSlot))}</time><span>${Number(matchData.durationMinutes) || 45} minutes</span></div></div>
+      <div class="schedule-card-actions"><button class="button" data-open-match="${escapeHtml(matchData.roomId)}">${action}</button>${matchData.status === 'matched' ? `<button class="text-button" data-cancel-match="${escapeHtml(matchData.roomId)}">Cancel interview</button>` : ''}</div>
+    </article>`;
+  }).join('') : '<p class="schedule-empty">No upcoming interviews yet.</p>';
+  offers.innerHTML = listings.length ? listings.map(listing => `<article class="schedule-card" data-own-listing-id="${escapeHtml(listing.listingId)}">
+    <div class="schedule-card-main"><div class="schedule-card-copy"><span class="match-badge">Offering as ${escapeHtml(modes[normalizedMode(listing.practiceMode)].title)}</span><h3>${escapeHtml(listing.interviewType)}</h3><p>${escapeHtml((listing.languages || []).join(' · ') || 'Interview session')}</p></div><div class="schedule-card-meta"><time datetime="${escapeHtml(listing.slot)}">${escapeHtml(formatSlot(listing.slot))}</time><span>45 minutes</span></div></div>
+    <div class="schedule-card-actions"><button class="text-button" data-cancel-listing="${escapeHtml(listing.listingId)}">Cancel offer</button></div>
+  </article>`).join('') : '<p class="schedule-empty">You have no open times. Add one whenever you are ready.</p>';
+  upcoming.querySelectorAll('[data-open-match]').forEach(button => button.onclick = () => {
+    const selected = state.activeMatches.find(item => item.roomId === button.dataset.openMatch);
+    if (selected) { selectMatch(selected); go(selected.status === 'feedback_pending' ? 'feedback' : 'match'); }
+  });
+  upcoming.querySelectorAll('[data-cancel-match]').forEach(button => button.onclick = () => cancelScheduledMatch(button));
+  offers.querySelectorAll('[data-cancel-listing]').forEach(button => button.onclick = () => cancelOwnListing(button));
+}
+
+async function cancelScheduledMatch(button) {
+  const roomId = button.dataset.cancelMatch;
+  if (!roomId || !confirm('Cancel this interview for both participants?')) return;
+  button.disabled = true; button.textContent = 'Cancelling…';
+  const response = await request('cancel-match', roomId);
+  if (!response.ok) { button.disabled = false; button.textContent = 'Cancel interview'; return toast(response.error); }
+  applyScheduleResponse(response);
+  clearActiveMatch(roomId);
+  toast('Interview cancelled.');
+  await refreshMarketplace(false);
+}
+
+async function cancelOwnListing(button) {
+  const listingId = button.dataset.cancelListing;
+  if (!listingId) return;
+  button.disabled = true; button.textContent = 'Cancelling…';
+  const response = await request('cancel-listing', { listingId });
+  if (!response.ok) { button.disabled = false; button.textContent = 'Cancel offer'; return toast(response.error); }
+  applyScheduleResponse(response);
+  if (!Array.isArray(response.ownListings)) state.ownListings = state.ownListings.filter(item => item.listingId !== listingId);
+  toast('Offer cancelled.');
+  await refreshMarketplace(false);
 }
 
 function marketplace() {
-  const active = !closedMatch(state.match) ? state.match : null;
-  const joinState = active ? scheduledJoinState(active) : null;
-  const waiting = state.profile?.status === 'waiting';
   root.innerHTML = frame(`<section class="marketplace-page sessions-board" aria-labelledby="marketplace-title">
     <header class="marketplace-heading"><div><h1 class="page-title" id="marketplace-title" tabindex="-1">Interview sessions</h1><p class="page-subtitle">Book an open time or add your own availability.</p></div><button class="button" data-create-role="candidate">Create a session</button></header>
-    ${active ? `<section class="upcoming-card"><div><span>Your next interview</span><h2>${escapeHtml(active.interviewType)} with ${escapeHtml(active.peer.name)}</h2><p>${escapeHtml(formatSlot(active.sharedSlot))} · You are the ${escapeHtml(modes[normalizedMode(active.practiceMode)].title)}</p></div><button class="button" data-route="match">${active.status === 'feedback_pending' ? 'Complete feedback' : joinState.allowed ? 'Join now' : 'View booking'}</button></section>` : ''}
-    ${waiting ? `<div class="availability-inline"><span>Your ${escapeHtml(modes[normalizedMode(state.profile.practiceMode)].title)} slot is published for ${escapeHtml(formatSlot(state.profile.slots?.[0]))}.</span><button class="text-button" id="cancel-listing">Remove listing</button></div>` : ''}
+    <section class="your-schedule" aria-labelledby="your-schedule-title"><div class="schedule-heading"><div><h2 id="your-schedule-title">Your schedule</h2><p id="schedule-summary">Loading your bookings and open times…</p></div></div>
+      <section class="schedule-section" aria-labelledby="upcoming-title"><h3 class="schedule-section-heading" id="upcoming-title">Upcoming interviews</h3><div class="schedule-list" id="upcoming-schedule"></div></section>
+      <section class="schedule-section" aria-labelledby="offers-title"><h3 class="schedule-section-heading" id="offers-title">Your open times</h3><div class="schedule-list" id="open-offers"></div></section>
+    </section>
     <section class="available-section"><div class="section-row"><div><h2>Available interviews</h2><p>Booking automatically gives you the opposite role.</p></div><p class="marketplace-count" id="marketplace-count" role="status" aria-live="polite">Loading…</p></div>
       <div id="marketplace-results" class="session-list" role="list" aria-busy="true"><p class="empty-state">Loading available sessions…</p></div>
     </section>
@@ -330,7 +629,7 @@ function marketplace() {
     sessionStorage.setItem('mocksyra-mode', state.selectedMode);
     go('onboarding');
   });
-  if (waiting) root.querySelector('#cancel-listing').onclick = async () => { const response = await request('cancel-search'); if (!response.ok) return toast(response.error); state.profile.status = 'idle'; localStorage.setItem(PROFILE_KEY, JSON.stringify(state.profile)); toast('Your listing was removed.'); marketplace(); };
+  renderYourSchedule();
   refreshMarketplace();
 }
 
@@ -344,24 +643,41 @@ function formatSlot(value) {
   const today = new Date();
   const tomorrow = new Date(today); tomorrow.setDate(today.getDate() + 1);
   const sameDay = target => date.getFullYear() === target.getFullYear() && date.getMonth() === target.getMonth() && date.getDate() === target.getDate();
-  const prefix = sameDay(today) ? 'Today' : sameDay(tomorrow) ? 'Tomorrow' : date.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+  const prefix = sameDay(today) ? 'Today' : sameDay(tomorrow) ? 'Tomorrow' : date.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric', ...(date.getFullYear() !== today.getFullYear() ? { year: 'numeric' } : {}) });
   return `${prefix} · ${date.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}`;
 }
 
 async function ensureMedia() {
   if (state.stream?.active) return true;
-  try { state.stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true }); return true; }
+  const generation = state.callGeneration;
+  const useStream = stream => {
+    if (generation !== state.callGeneration) {
+      stream?.getTracks().forEach(track => track.stop());
+      return false;
+    }
+    state.stream = stream;
+    return true;
+  };
+  try { return useStream(await navigator.mediaDevices.getUserMedia({ video: true, audio: true })); }
   catch {
-    try { state.stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false }); toast('Camera unavailable. Audio-only mode is ready.'); return true; }
-    catch { toast('Allow microphone access in your browser before joining.'); return false; }
+    if (generation !== state.callGeneration) return false;
+    try {
+      const ready = useStream(await navigator.mediaDevices.getUserMedia({ audio: true, video: false }));
+      if (ready) toast('Camera unavailable. Audio-only mode is ready.');
+      return ready;
+    }
+    catch { if (generation === state.callGeneration) toast('Allow microphone access in your browser before joining.'); return false; }
   }
 }
 
 async function deviceCheck() {
   const status = root.querySelector('#device-status');
   status.textContent = 'Requesting permission…';
-  if (!(await ensureMedia())) { status.textContent = 'Microphone and camera unavailable'; status.className = 'device-status error'; return; }
+  const ready = await ensureMedia();
+  if (!status.isConnected) return;
+  if (!ready) { status.textContent = 'Microphone and camera unavailable'; status.className = 'device-status error'; return; }
   const preview = root.querySelector('#device-preview');
+  if (!preview) return;
   preview.srcObject = state.stream; preview.hidden = false;
   const audio = state.stream.getAudioTracks().length > 0, video = state.stream.getVideoTracks().length > 0;
   status.textContent = `${audio ? '✓ Microphone' : '✕ Microphone'} · ${video ? '✓ Camera' : 'Audio only'}`;
@@ -401,15 +717,19 @@ function match() {
     if (!confirm('Cancel this match for both participants?')) return;
     const result = await request('cancel-match', state.roomId);
     if (!result.ok) return toast(result.error);
-    clearActiveMatch(); go('marketplace');
+    clearActiveMatch(state.roomId); go('marketplace');
   });
   root.querySelector('#join').onclick = async () => {
     if (feedbackPending) return go('feedback');
+    const roomId = state.roomId, matchData = state.match, generation = state.callGeneration;
+    const isCurrent = () => routeName() === 'match' && state.roomId === roomId && state.match === matchData && state.callGeneration === generation;
     if (!(await connectSocket())) return;
-    if (state.match.videoProvider === 'daily') { endLocalCall(); return go('session'); }
-    const prepared = await request('prepare-call', { roomId: state.roomId });
+    if (!isCurrent()) return;
+    if (matchData.videoProvider === 'daily') { endLocalCall(); return go('session'); }
+    const prepared = await request('prepare-call', { roomId });
+    if (!isCurrent()) return;
     if (!prepared.ok) return toast(prepared.error);
-    if (await ensureMedia()) go('session');
+    if (await ensureMedia() && isCurrent()) go('session');
   };
   clearInterval(state.joinClock);
   if (!feedbackPending) state.joinClock = setInterval(() => {
@@ -420,13 +740,20 @@ function match() {
 }
 
 function calendarDate(value) { return new Date(value).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, ''); }
+function calendarText(value) { return String(value || '').replace(/\\/g, '\\\\').replace(/\r?\n/g, '\\n').replace(/;/g, '\\;').replace(/,/g, '\\,'); }
+function foldCalendarLine(line) {
+  const characters = [...String(line)];
+  const rows = [];
+  while (characters.length) rows.push(`${rows.length ? ' ' : ''}${characters.splice(0, rows.length ? 73 : 74).join('')}`);
+  return rows.join('\r\n');
+}
 function downloadCalendar() {
   if (!state.match?.sharedSlot) return toast('No scheduled time is available.');
   const start = new Date(state.match.sharedSlot), end = new Date(start.getTime() + sessionMinutes() * 60 * 1000);
-  const url = `${location.origin}${location.pathname}#match`;
+  const url = `${location.origin}${location.pathname}#match?room=${encodeURIComponent(state.roomId)}`;
   const body = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//Mocksyra//Interview//EN', 'BEGIN:VEVENT',
     `UID:${state.roomId}@mocksyra`, `DTSTAMP:${calendarDate(new Date())}`, `DTSTART:${calendarDate(start)}`, `DTEND:${calendarDate(end)}`,
-    `SUMMARY:Mocksyra interview with ${state.match.peer.name}`, `DESCRIPTION:Open Mocksyra to join your interview: ${url}`, `URL:${url}`, 'END:VEVENT', 'END:VCALENDAR'].join('\r\n');
+    `SUMMARY:Mocksyra interview with ${calendarText(state.match.peer.name)}`, `DESCRIPTION:Open Mocksyra to join your interview: ${calendarText(url)}`, `URL:${calendarText(url)}`, 'END:VEVENT', 'END:VCALENDAR'].map(foldCalendarLine).join('\r\n');
   const link = document.createElement('a');
   link.href = URL.createObjectURL(new Blob([body], { type: 'text/calendar' })); link.download = 'mocksyra-interview.ics'; link.click(); URL.revokeObjectURL(link.href);
 }
@@ -434,6 +761,7 @@ function downloadCalendar() {
 function session() {
   const dailySession = state.match?.videoProvider === 'daily';
   if (!state.match || (!dailySession && !state.stream?.active)) return go('match');
+  const roomId = state.roomId;
   const peer = state.match.peer, question = state.match.question || {};
   const minutes = sessionMinutes(), initialTimer = `${minutes}:00`;
   const videoSurface = dailySession ? `<div class="call-stage daily-call-stage tool-panel" id="video-panel"><div class="call-top"><span class="live">● HOSTED VIDEO</span><span id="timer">${initialTimer}</span></div><p class="daily-status" id="daily-status">Preparing your private video room…</p><div class="daily-container" id="daily-container"></div><div class="daily-finish"><button class="call-action end" id="complete"><b>×</b><span>Finish interview</span></button></div></div>` : `<div class="call-stage tool-panel" id="video-panel"><div class="call-top"><span class="live">● LIVE SESSION</span><span id="timer">${initialTimer}</span></div>
@@ -458,18 +786,39 @@ function session() {
     root.querySelector('#mic').onclick = event => toggleTrack('audio', event.currentTarget);
     root.querySelector('#cam').onclick = event => toggleTrack('video', event.currentTarget);
   }
-  root.querySelector('#complete').onclick = () => { if (confirm('Finish the interview for both participants and open feedback?')) socket.emit('complete-session', state.roomId); };
+  root.querySelector('#complete').onclick = () => { if (confirm('Finish the interview for both participants and open feedback?')) socket.emit('complete-session', roomId); };
+}
+
+async function joinCurrentCallRoom(roomId, generation) {
+  const connectionId = socket.id;
+  const wasAlreadyLive = state.liveRoomId === roomId;
+  const joined = await request('join-session', roomId);
+  const sameConnection = socket.connected && socket.id === connectionId;
+  const stillCurrent = state.roomId === roomId && state.callGeneration === generation && routeName() === 'session';
+  if (!sameConnection || !stillCurrent) {
+    if (joined.ok && !joined.stale && sameConnection && (!wasAlreadyLive || state.liveRoomId === roomId)) socket.emit('leave-session', roomId);
+    return { ...joined, staleCall: true };
+  }
+  if (!joined.ok) {
+    if (!joined.stale) socket.emit('leave-session', roomId);
+    return joined;
+  }
+  state.liveRoomId = roomId;
+  return joined;
 }
 
 async function prepareDailyCall() {
+  const roomId = state.roomId, generation = state.callGeneration;
+  const isCurrent = call => generation === state.callGeneration && state.roomId === roomId && routeName() === 'session' && (!call || state.dailyCall === call);
   const status = root.querySelector('#daily-status'), container = root.querySelector('#daily-container');
   if (!window.DailyIframe) { status.textContent = 'The hosted video component could not load. Check your connection and refresh.'; status.classList.add('error'); return; }
-  const access = await request('prepare-call', { roomId: state.roomId }, 30_000);
+  const access = await request('prepare-call', { roomId }, 30_000);
+  if (!isCurrent()) { if (access) access.token = ''; return; }
   if (!access.ok) { status.textContent = access.error; status.classList.add('error'); return; }
   if (access.provider !== 'daily') {
     state.match.videoProvider = 'webrtc';
     status.textContent = 'Using the browser video fallback…';
-    if (await ensureMedia()) session();
+    if (await ensureMedia() && isCurrent()) session();
     return;
   }
   const call = window.DailyIframe.createFrame(container, {
@@ -478,19 +827,49 @@ async function prepareDailyCall() {
   });
   state.dailyCall = call;
   call.on('joined-meeting', async () => {
+    if (!isCurrent(call)) {
+      Promise.resolve(call.leave()).catch(() => {}).finally(() => { try { call.destroy(); } catch {} });
+      return;
+    }
+    status.textContent = 'Verifying this interview room…';
+    const joined = await joinCurrentCallRoom(roomId, generation);
+    if (!isCurrent(call)) {
+      Promise.resolve(call.leave()).catch(() => {}).finally(() => { try { call.destroy(); } catch {} });
+      return;
+    }
+    if (!joined.ok) {
+      if (state.liveRoomId === roomId) state.liveRoomId = null;
+      if (state.dailyCall === call) state.dailyCall = null;
+      status.textContent = joined.error; status.classList.add('error');
+      Promise.resolve(call.leave()).catch(() => {}).finally(() => { try { call.destroy(); } catch {} });
+      return;
+    }
     status.textContent = 'Secure video connected.'; status.classList.add('ready');
-    const joined = await request('join-session', state.roomId);
-    if (!joined.ok) { status.textContent = joined.error; status.classList.add('error'); return; }
     if (joined.startedAt) startSyncedTimer(joined.startedAt);
-    socket.emit('workspace-request', state.roomId);
+    socket.emit('workspace-request', roomId);
   });
-  call.on('left-meeting', () => { socket.emit('leave-session', state.roomId); if (state.dailyCall === call) state.dailyCall = null; try { call.destroy(); } catch {} if (location.hash === '#session') go('match'); });
-  call.on('error', event => { status.textContent = event?.errorMsg || 'Video connection interrupted. Please retry.'; status.classList.add('error'); });
+  call.on('left-meeting', () => {
+    const wasCurrent = state.dailyCall === call;
+    if (state.liveRoomId === roomId) {
+      state.liveRoomId = null;
+      if (socket.connected) socket.emit('leave-session', roomId);
+    }
+    if (wasCurrent) state.dailyCall = null;
+    try { call.destroy(); } catch {}
+    if (wasCurrent && routeName() === 'session' && state.roomId === roomId) go('match');
+  });
+  call.on('error', event => { if (isCurrent(call)) { status.textContent = event?.errorMsg || 'Video connection interrupted. Please retry.'; status.classList.add('error'); } });
   try {
     await call.join({ url: access.roomUrl, token: access.token });
     access.token = '';
+    if (!isCurrent(call)) Promise.resolve(call.leave()).catch(() => {}).finally(() => { try { call.destroy(); } catch {} });
   } catch {
-    status.textContent = 'Could not enter the hosted video room. Please refresh and retry.'; status.classList.add('error');
+    access.token = '';
+    if (isCurrent(call)) {
+      state.dailyCall = null;
+      status.textContent = 'Could not enter the hosted video room. Please refresh and retry.'; status.classList.add('error');
+      try { call.destroy(); } catch {}
+    }
   }
 }
 
@@ -508,28 +887,60 @@ function toggleTrack(kind, button) {
   button.querySelector('span').textContent = tracks.length && tracks[0].enabled ? (kind === 'audio' ? 'Microphone' : 'Camera') : (kind === 'audio' ? 'Mic off' : 'Camera off');
 }
 
-function prepareCall() {
-  state.pendingCandidates = []; state.offerStarted = false;
+async function prepareCall() {
+  const roomId = state.roomId, generation = state.callGeneration;
+  state.offerStarted = false;
   const pc = state.pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+  pc.pendingCandidates = [];
   state.stream.getTracks().forEach(track => pc.addTrack(track, state.stream));
-  pc.ontrack = event => { const remote = root.querySelector('#remote'); if (remote) remote.srcObject = event.streams[0]; updateConnection(`${state.match.peer.name} · connected`, true); };
-  pc.onicecandidate = event => { if (event.candidate) socket.emit('signal', { roomId: state.roomId, data: { candidate: event.candidate } }); };
+  pc.ontrack = event => {
+    if (state.pc !== pc || state.roomId !== roomId || state.callGeneration !== generation) return;
+    const remote = root.querySelector('#remote'); if (remote) remote.srcObject = event.streams[0]; updateConnection(`${state.match.peer.name} · connected`, true);
+  };
+  pc.onicecandidate = event => {
+    if (event.candidate && state.pc === pc && state.roomId === roomId && state.callGeneration === generation) socket.emit('signal', { roomId, data: { candidate: event.candidate } });
+  };
   pc.onconnectionstatechange = () => {
+    if (state.pc !== pc || state.roomId !== roomId || state.callGeneration !== generation) return;
     if (pc.connectionState === 'failed') updateConnection('Connection failed — check network or try audio-only mode', false);
     if (pc.connectionState === 'disconnected') updateConnection('Video connection interrupted — retrying…', false);
   };
-  socket.emit('join-session', state.roomId); socket.emit('workspace-request', state.roomId);
+  const joined = await joinCurrentCallRoom(roomId, generation);
+  if (state.pc !== pc || state.roomId !== roomId || state.callGeneration !== generation || routeName() !== 'session') return;
+  if (!joined.ok) {
+    toast(joined.error || 'This interview room is unavailable.');
+    go('match');
+    return;
+  }
+  if (joined.startedAt) startSyncedTimer(joined.startedAt);
+  socket.emit('workspace-request', roomId);
 }
 
 async function handleSignal(data) {
-  const pc = state.pc; if (!pc) return;
+  const roomId = data?.roomId || state.roomId;
+  if (roomId !== state.roomId) return;
+  const pc = state.pc, generation = state.callGeneration;
+  if (!pc) return;
+  const isCurrent = () => state.pc === pc && state.roomId === roomId && state.callGeneration === generation && routeName() === 'session';
   try {
-    if (data.offer) { await pc.setRemoteDescription(data.offer); await flushCandidates(); const answer = await pc.createAnswer(); await pc.setLocalDescription(answer); socket.emit('signal', { roomId: state.roomId, data: { answer } }); }
-    else if (data.answer) { await pc.setRemoteDescription(data.answer); await flushCandidates(); }
-    else if (data.candidate) { if (pc.remoteDescription) await pc.addIceCandidate(data.candidate); else state.pendingCandidates.push(data.candidate); }
-  } catch { updateConnection('Could not establish the video connection. Try rejoining.', false); }
+    if (data.offer) {
+      await pc.setRemoteDescription(data.offer); if (!isCurrent()) return;
+      await flushCandidates(pc, isCurrent); if (!isCurrent()) return;
+      const answer = await pc.createAnswer(); if (!isCurrent()) return;
+      await pc.setLocalDescription(answer); if (!isCurrent()) return;
+      socket.emit('signal', { roomId, data: { answer } });
+    } else if (data.answer) {
+      await pc.setRemoteDescription(data.answer); if (!isCurrent()) return;
+      await flushCandidates(pc, isCurrent);
+    } else if (data.candidate && isCurrent()) {
+      if (pc.remoteDescription) await pc.addIceCandidate(data.candidate);
+      else pc.pendingCandidates.push(data.candidate);
+    }
+  } catch { if (isCurrent()) updateConnection('Could not establish the video connection. Try rejoining.', false); }
 }
-async function flushCandidates() { while (state.pendingCandidates.length) await state.pc.addIceCandidate(state.pendingCandidates.shift()); }
+async function flushCandidates(pc, isCurrent) {
+  while (pc.pendingCandidates.length && isCurrent()) await pc.addIceCandidate(pc.pendingCandidates.shift());
+}
 function updateConnection(text, ready) {
   const status = root.querySelector('#peer-status'), banner = root.querySelector('#connection');
   if (status) status.textContent = text;
@@ -548,9 +959,18 @@ function startSyncedTimer(startedAt) {
 }
 
 function bindWorkspace() {
-  const editor = root.querySelector('#shared-code'), language = root.querySelector('#code-language'); let debounce;
-  editor.oninput = () => { state.workspace.code = editor.value; clearTimeout(debounce); root.querySelector('#sync-status').textContent = 'Syncing…'; debounce = setTimeout(() => socket.emit('workspace-update', { roomId: state.roomId, code: editor.value, language: language.value }), 120); };
-  language.onchange = () => { state.workspace.language = language.value; socket.emit('workspace-update', { roomId: state.roomId, code: editor.value, language: language.value }); };
+  const editor = root.querySelector('#shared-code'), language = root.querySelector('#code-language');
+  const roomId = state.roomId, generation = state.callGeneration;
+  const isCurrent = () => state.roomId === roomId && state.callGeneration === generation && routeName() === 'session';
+  let debounce;
+  editor.oninput = () => {
+    state.workspace.code = editor.value;
+    clearTimeout(debounce);
+    root.querySelector('#sync-status').textContent = 'Syncing…';
+    const code = editor.value, selectedLanguage = language.value;
+    debounce = setTimeout(() => { if (isCurrent()) socket.emit('workspace-update', { roomId, code, language: selectedLanguage }); }, 120);
+  };
+  language.onchange = () => { if (isCurrent()) { state.workspace.language = language.value; socket.emit('workspace-update', { roomId, code: editor.value, language: language.value }); } };
   root.querySelector('#copy-code').onclick = async () => { await navigator.clipboard.writeText(editor.value); toast('Workspace copied.'); };
   root.querySelector('#run-code').onclick = () => runJavaScript(editor.value);
 }
@@ -577,10 +997,18 @@ function renderChat() {
 }
 
 function endLocalCall() {
+  state.callGeneration += 1;
   clearInterval(state.clock); clearInterval(state.joinClock);
   state.stream?.getTracks().forEach(track => track.stop()); state.pc?.close(); state.stream = null; state.pc = null;
   const daily = state.dailyCall; state.dailyCall = null;
   if (daily) { Promise.resolve(daily.leave()).catch(() => {}).finally(() => { try { daily.destroy(); } catch {} }); }
+}
+
+function leaveLiveSession(notifyServer = true) {
+  const roomId = state.liveRoomId;
+  state.liveRoomId = null;
+  if (notifyServer && roomId && socket.connected) socket.emit('leave-session', roomId);
+  endLocalCall();
 }
 
 function feedback() {
@@ -620,8 +1048,9 @@ function dashboard() {
 
 function activity() {
   const completed = state.history.length;
+  const upcomingCount = state.activeMatches.filter(item => !closedMatch(item)).length;
   root.innerHTML = frame(`<section class="simple-page activity-page"><header class="simple-page-heading"><p class="eyebrow">ACTIVITY</p><h1 class="page-title">Your interviews</h1><p class="page-subtitle">${completed} completed interview${completed === 1 ? '' : 's'}.</p></header>
-    ${state.match ? '<div class="notice">You have an upcoming interview. <button class="text-button" data-route="match">Open booking →</button></div>' : ''}
+    ${upcomingCount ? `<div class="notice">You have ${upcomingCount} upcoming interview${upcomingCount === 1 ? '' : 's'}. <button class="text-button" data-route="marketplace">View schedule →</button></div>` : ''}
     <section class="panel"><div class="panel-heading"><h2>Interview history</h2><button class="button secondary" data-route="marketplace">Find an interview</button></div>
       <div class="history-list">${state.history.length ? state.history.map((item, index) => `<article class="history-card"><div><span class="match-badge">${escapeHtml(item.interviewType)}</span><h3>${escapeHtml(item.peer.name)}</h3><p>${escapeHtml(formatSlot(item.sharedSlot))} · ${escapeHtml(item.peer.experience)}</p></div><div><b>${item.feedbackReceived ? `${(item.feedbackReceived.scores.reduce((a, b) => a + b, 0) / 3).toFixed(1)}/5` : 'Pending'}</b><button class="text-button" data-summary="${index}">Download summary</button></div></article>`).join('') : '<p class="empty-state">Complete your first interview to build a feedback history.</p>'}</div>
     </section><details class="notification-drawer"><summary>Recent updates (${state.notifications.length})</summary><div class="notification-drawer-actions"><button class="text-button" id="enable-alerts">Enable browser alerts</button></div><div class="notification-list">${state.notifications.length ? state.notifications.map(item => `<article><b>${escapeHtml(item.title)}</b><p>${escapeHtml(item.body)}</p><small>${new Date(item.createdAt).toLocaleString()}</small></article>`).join('') : '<p class="empty-state">No updates yet.</p>'}</div></details></section>`);
@@ -645,84 +1074,294 @@ function showSystemNotification(item) {
   if ('Notification' in window && Notification.permission === 'granted' && document.hidden) new Notification(item.title, { body: item.body });
 }
 
-function clearActiveMatch() {
-  endLocalCall();
-  state.match = null; state.roomId = null; state.feedback = null;
-  localStorage.removeItem('mocksyra-active-match');
+function clearActiveMatch(roomId = state.roomId) {
+  if (roomId) state.activeMatches = state.activeMatches.filter(item => item.roomId !== roomId);
+  persistMatches();
+  if (!roomId || state.roomId === roomId) {
+    endLocalCall();
+    state.match = null; state.roomId = null; state.feedback = null;
+    state.workspace = { code: '', language: 'JavaScript', version: 0 };
+    state.chat = [];
+    localStorage.removeItem(ACTIVE_MATCH_KEY);
+  }
 }
 
-socket.on('connect', () => socket.emit('restore-profile'));
+function resetAccountState() {
+  state.liveRoomId = null;
+  cancelSocketConnection();
+  endLocalCall();
+  [PROFILE_KEY, ACTIVE_MATCH_KEY, ACTIVE_MATCHES_KEY].forEach(key => localStorage.removeItem(key));
+  sessionStorage.removeItem('mocksyra-mode');
+  state.profile = null;
+  state.activeMatches = [];
+  state.ownListings = [];
+  state.match = null;
+  state.roomId = null;
+  state.feedback = null;
+  state.history = [];
+  state.notifications = [];
+  state.listings = [];
+  state.workspace = { code: '', language: 'JavaScript', version: 0 };
+  state.chat = [];
+  state.selectedMode = null;
+  state.restored = false;
+}
+
+async function restoreLiveRoomAfterReconnect() {
+  const roomId = state.liveRoomId;
+  const generation = state.callGeneration;
+  const connectionId = socket.id;
+  const daily = state.dailyCall;
+  const pc = state.pc;
+  if (!roomId || roomId !== state.roomId || routeName() !== 'session' || (!daily && !pc)) return;
+  if (pc) state.offerStarted = false;
+  const joined = await joinCurrentCallRoom(roomId, generation);
+  const stillCurrent = socket.connected && socket.id === connectionId && state.roomId === roomId && state.liveRoomId === roomId && state.callGeneration === generation && routeName() === 'session' && (daily ? state.dailyCall === daily : state.pc === pc);
+  if (!stillCurrent) return;
+  if (!joined.ok) {
+    toast(joined.error || 'Your live interview could not reconnect. Please rejoin.');
+    leaveLiveSession(false);
+    go('match');
+    return;
+  }
+  if (joined.startedAt) startSyncedTimer(joined.startedAt);
+  socket.emit('workspace-request', roomId);
+}
+
+socket.on('connect', () => {
+  const currentAuthKey = authUserKey(state.authUser);
+  if (!currentAuthKey || ![connectedAuthKey, connectionPromiseKey].includes(currentAuthKey)) return socket.disconnect();
+  socket.emit('restore-profile');
+  restoreLiveRoomAfterReconnect();
+});
 socket.on('match-waiting', () => toast('Your availability is live. We will notify you when an interview is booked.'));
 socket.on('match-found', matchData => {
-  state.match = matchData; state.roomId = matchData.roomId; localStorage.setItem('mocksyra-active-match', JSON.stringify(matchData));
-  if (location.hash === '#marketplace') marketplace();
-  else if (['#search', '#onboarding'].includes(location.hash)) go('match');
+  upsertMatch(matchData);
+  if (!state.match || closedMatch(state.match)) selectMatch(matchData);
+  if (location.hash === '#marketplace') { renderYourSchedule(); refreshMarketplace(false); }
+  else if (['#search', '#onboarding'].includes(location.hash)) go('marketplace');
   else showSystemNotification({ title: 'Your Mocksyra match is ready', body: `You matched with ${matchData.peer.name}.` });
 });
 socket.on('match-cancelled', packet => {
-  if (!packet?.roomId || packet.roomId === state.roomId) clearActiveMatch();
+  const cancelledSelected = !packet?.roomId || packet.roomId === state.roomId;
+  clearActiveMatch(packet?.roomId || state.roomId);
   toast(packet?.message || 'This interview was cancelled.');
-  if (!['#home', '#auth'].includes(location.hash)) go('marketplace');
+  if (location.hash === '#marketplace') { renderYourSchedule(); refreshMarketplace(false); }
+  else if (cancelledSelected && !['#home', '#auth'].includes(location.hash)) go('marketplace');
 });
 socket.on('profile-state', restored => {
-  if (restored?.profile) { state.profile = { ...state.profile, ...restored.profile }; localStorage.setItem(PROFILE_KEY, JSON.stringify(state.profile)); }
-  if (restored?.activeMatch) { state.match = restored.activeMatch; state.roomId = restored.activeMatch.roomId; localStorage.setItem('mocksyra-active-match', JSON.stringify(restored.activeMatch)); }
-  else if (restored && Object.hasOwn(restored, 'activeMatch') && state.match && location.hash !== '#feedback') clearActiveMatch();
+  const currentEmail = String(state.authUser?.email || '').toLowerCase();
+  const restoredEmail = String(restored?.profile?.email || '').toLowerCase();
+  if (!socket.connected || connectedAuthKey !== authUserKey(state.authUser) || (restoredEmail && restoredEmail !== currentEmail)) return;
+  if (restored && Object.hasOwn(restored, 'profile')) {
+    state.profile = restored.profile ? { ...restored.profile } : null;
+    if (state.profile) localStorage.setItem(PROFILE_KEY, JSON.stringify(state.profile));
+    else localStorage.removeItem(PROFILE_KEY);
+  }
+  state.restored = true;
+  const hasSchedule = Array.isArray(restored?.activeMatches) || Array.isArray(restored?.upcomingMatches) || Object.hasOwn(restored || {}, 'activeMatch');
+  applyScheduleResponse(restored);
+  const refreshedSelected = state.activeMatches.find(item => item.roomId === state.roomId);
+  if (refreshedSelected) selectMatch(refreshedSelected);
+  else if (state.match && hasSchedule && !['#feedback', '#dashboard'].includes(location.hash)) clearActiveMatch(state.roomId);
+  else if (!state.match && restored?.activeMatch) selectMatch(restored.activeMatch);
   if (Array.isArray(restored?.history)) state.history = restored.history;
   if (Array.isArray(restored?.notifications)) state.notifications = restored.notifications;
-  if (location.hash === '#marketplace' && restored && Object.hasOwn(restored, 'activeMatch')) marketplace();
+  const requestedRoom = roomIdFromHash();
+  if (routeName() === 'match' && requestedRoom) {
+    const requestedMatch = state.activeMatches.find(item => item.roomId === requestedRoom);
+    if (requestedMatch) { selectMatch(requestedMatch); return match(); }
+    toast('That interview is no longer in your active schedule.');
+    return go('marketplace');
+  }
+  if (location.hash === '#marketplace' && hasSchedule) renderYourSchedule();
+});
+socket.on('schedule-updated', schedule => {
+  applyScheduleResponse(schedule);
+  const refreshedSelected = state.activeMatches.find(item => item.roomId === state.roomId);
+  if (refreshedSelected) selectMatch(refreshedSelected);
+  if (location.hash === '#marketplace') renderYourSchedule();
 });
 socket.on('session-listings', listings => { state.listings = listings || []; if (location.hash === '#marketplace') renderMarketplaceResults(); });
 socket.on('listings-updated', () => { if (location.hash === '#marketplace') refreshMarketplace(false); });
 socket.on('notifications', notifications => { state.notifications = notifications || []; if (location.hash === '#activity') activity(); });
 socket.on('notification', notification => { state.notifications = [notification, ...state.notifications.filter(item => item.id !== notification.id)]; showSystemNotification(notification); if (location.hash === '#activity') activity(); });
 socket.on('history', history => { state.history = history || []; if (location.hash === '#activity') activity(); });
-socket.on('peer-entered-room', () => { toast('Your interview partner entered the room.'); const button = root.querySelector('#join'); if (button) { button.textContent = 'Partner is ready — join now'; button.classList.add('button-light'); } });
+socket.on('peer-entered-room', packet => {
+  if (packet?.roomId && packet.roomId !== state.roomId) return;
+  toast('Your interview partner entered the room.');
+  const button = root.querySelector('#join');
+  if (button) { button.textContent = 'Partner is ready — join now'; button.classList.add('button-light'); }
+});
 socket.on('session-ready', async packet => {
+  const roomId = packet?.roomId || state.roomId;
+  const scheduled = state.activeMatches.find(item => item.roomId === roomId);
+  if (scheduled) upsertMatch({ ...scheduled, status: 'in_progress', startedAt: packet.startedAt || scheduled.startedAt });
+  if (roomId !== state.roomId) { if (location.hash === '#marketplace') renderYourSchedule(); return; }
+  if (scheduled) selectMatch({ ...scheduled, status: 'in_progress', startedAt: packet.startedAt || scheduled.startedAt });
   if (packet.startedAt) startSyncedTimer(packet.startedAt);
   if (state.match?.videoProvider === 'daily') { const status = root.querySelector('#daily-status'); if (status) { status.textContent = 'Both participants are here. Your session has started.'; status.classList.add('ready'); } return; }
-  if (!state.pc) return;
-  if (state.match?.startsAsInterviewer && !state.offerStarted) { state.offerStarted = true; const offer = await state.pc.createOffer(); await state.pc.setLocalDescription(offer); socket.emit('signal', { roomId: state.roomId, data: { offer } }); }
+  const pc = state.pc, generation = state.callGeneration;
+  if (!pc) return;
+  const isCurrent = () => state.pc === pc && state.roomId === roomId && state.callGeneration === generation && routeName() === 'session';
+  if (state.match?.startsAsInterviewer && !state.offerStarted) {
+    state.offerStarted = true;
+    const offer = await pc.createOffer(); if (!isCurrent()) return;
+    await pc.setLocalDescription(offer); if (!isCurrent()) return;
+    socket.emit('signal', { roomId, data: { offer } });
+  }
   updateConnection('Partner joined — establishing secure connection…', false);
 });
 socket.on('signal', handleSignal);
 socket.on('workspace-state', workspace => {
-  state.workspace = workspace || state.workspace; const editor = root.querySelector('#shared-code'), language = root.querySelector('#code-language');
+  if (workspace?.roomId && workspace.roomId !== state.roomId) return;
+  const { roomId, ...roomWorkspace } = workspace || {};
+  state.workspace = Object.keys(roomWorkspace).length ? roomWorkspace : state.workspace; const editor = root.querySelector('#shared-code'), language = root.querySelector('#code-language');
   if (editor && document.activeElement !== editor) editor.value = state.workspace.code || ''; if (language) language.value = state.workspace.language || 'JavaScript';
   const status = root.querySelector('#sync-status'); if (status) status.textContent = 'Synced with your partner';
 });
-socket.on('workspace-update', workspace => { state.workspace = workspace; const editor = root.querySelector('#shared-code'); if (editor && document.activeElement !== editor) editor.value = workspace.code; const status = root.querySelector('#sync-status'); if (status) status.textContent = 'Partner updated the workspace'; });
-socket.on('chat-state', messages => { state.chat = messages || []; renderChat(); });
-socket.on('chat-message', message => { state.chat.push(message); renderChat(); });
-socket.on('peer-left', () => updateConnection('Your partner left the room. They can rejoin.', false));
-socket.on('session-ended', () => { endLocalCall(); go('feedback'); });
-socket.on('peer-feedback-submitted', () => {
+socket.on('workspace-update', workspace => {
+  if (workspace?.roomId && workspace.roomId !== state.roomId) return;
+  const { roomId, ...roomWorkspace } = workspace || {};
+  state.workspace = roomWorkspace;
+  const editor = root.querySelector('#shared-code'); if (editor && document.activeElement !== editor) editor.value = roomWorkspace.code || '';
+  const status = root.querySelector('#sync-status'); if (status) status.textContent = 'Partner updated the workspace';
+});
+socket.on('chat-state', packet => {
+  const roomId = Array.isArray(packet) ? state.roomId : packet?.roomId;
+  if (roomId && roomId !== state.roomId) return;
+  state.chat = Array.isArray(packet) ? packet : packet?.messages || [];
+  renderChat();
+});
+socket.on('chat-message', message => {
+  if (message?.roomId && message.roomId !== state.roomId) return;
+  const { roomId, ...item } = message || {};
+  state.chat.push(item); renderChat();
+});
+socket.on('peer-left', packet => { if (!packet?.roomId || packet.roomId === state.roomId) updateConnection('Your partner left the room. They can rejoin.', false); });
+socket.on('session-ended', packet => {
+  const roomId = packet?.roomId || state.roomId;
+  const completedMatch = state.activeMatches.find(item => item.roomId === roomId);
+  if (completedMatch) upsertMatch({ ...completedMatch, status: 'feedback_pending' });
+  if (roomId !== state.roomId) {
+    if (location.hash === '#marketplace') renderYourSchedule();
+    return showSystemNotification({ title: 'An interview ended', body: 'Open your schedule when you are ready to leave feedback.' });
+  }
+  if (completedMatch) selectMatch({ ...completedMatch, status: 'feedback_pending' });
+  leaveLiveSession(); go('feedback');
+});
+socket.on('peer-feedback-submitted', packet => {
+  if (packet?.roomId && packet.roomId !== state.roomId) return showSystemNotification({ title: 'Feedback received', body: 'Your partner submitted feedback for another interview.' });
   const button = root.querySelector('#submit');
   if (button?.disabled) button.textContent = 'Partner submitted — finalizing feedback…';
   else toast('Your partner has submitted feedback. Complete yours when ready.');
 });
 socket.on('feedback-ready', feedbackData => {
+  const completedRoomId = feedbackData?.roomId || state.roomId;
+  state.activeMatches = state.activeMatches.filter(item => item.roomId !== completedRoomId);
+  persistMatches();
+  if (completedRoomId !== state.roomId) {
+    if (location.hash === '#marketplace') renderYourSchedule();
+    socket.emit('restore-profile');
+    return showSystemNotification({ title: 'Interview feedback is ready', body: 'Open History to review it.' });
+  }
   state.feedback = feedbackData;
-  localStorage.removeItem('mocksyra-active-match');
+  localStorage.removeItem(ACTIVE_MATCH_KEY);
   socket.emit('restore-profile');
   go('dashboard');
 });
 socket.on('app-error', message => toast(message));
-socket.on('connect_error', error => { if (error.message === 'Authentication required') { localStorage.removeItem(EMAIL_KEY); if (location.hash !== '#home') go('auth'); } });
+socket.on('connect_error', error => { if (error.message === 'Authentication required') recoverSocketAuthentication(); });
 
 async function logout() {
-  endLocalCall(); socket.disconnect(); await window.peerSupabase.auth.signOut();
-  localStorage.removeItem(EMAIL_KEY); localStorage.removeItem(PROFILE_KEY); localStorage.removeItem('mocksyra-active-match');
-  state.profile = null; state.authUser = null; state.match = null; state.history = []; state.notifications = []; go('home'); toast('You have been logged out.');
+  logoutInProgress = true;
+  let remoteSignOutFailed = false;
+  try {
+    const result = await window.peerSupabase.auth.signOut();
+    remoteSignOutFailed = Boolean(result?.error);
+  } catch { remoteSignOutFailed = true; }
+  finally {
+    if (remoteSignOutFailed) clearSupabaseStoredSession();
+    resetAccountState();
+    localStorage.removeItem(EMAIL_KEY);
+    localStorage.removeItem(ACCOUNT_KEY);
+    window.__mocksyraAuthUser = null;
+    window.__mocksyraAccessToken = '';
+    state.authUser = null;
+    state.authenticated = false;
+    state.authResolved = true;
+    logoutInProgress = false;
+    go('home');
+    toast(remoteSignOutFailed ? 'Logged out on this device.' : 'You have been logged out.');
+  }
 }
 document.addEventListener('click', event => { if (event.target.closest('#logout')) logout(); });
 
+const routeName = () => (location.hash.slice(1).split('?')[0] || 'home');
+const roomIdFromHash = () => {
+  const query = location.hash.slice(1).split('?')[1] || '';
+  return new URLSearchParams(query).get('room') || '';
+};
+const protectedRoutes = ['onboarding', 'marketplace', 'search', 'match', 'session', 'feedback', 'dashboard', 'activity'];
+function renderAccountLoading() {
+  root.innerHTML = '<div class="app-shell"><main class="app-main"><div class="shell auth-shell"><section class="panel auth-panel"><p class="page-subtitle" role="status">Checking your account…</p></section></div></main></div>';
+}
+function applyAuthenticatedUser(user, source = '') {
+  const wasResolved = state.authResolved;
+  const nextKey = authUserKey(user);
+  const storedKey = localStorage.getItem(ACCOUNT_KEY) || '';
+  const cachedEmail = String(localStorage.getItem(EMAIL_KEY) || '').toLowerCase();
+  const nextEmail = String(user?.email || '').toLowerCase();
+  const previousKey = authUserKey(state.authUser);
+  const accountChanged = Boolean(nextKey && ((storedKey && storedKey !== nextKey) || (!storedKey && cachedEmail && cachedEmail !== nextEmail) || (previousKey && previousKey !== nextKey)));
+  state.authResolved = true;
+  if (!nextKey) {
+    resetAccountState();
+    localStorage.removeItem(EMAIL_KEY);
+    localStorage.removeItem(ACCOUNT_KEY);
+    state.authUser = null;
+    state.authenticated = false;
+    state.authResolved = true;
+    if (!logoutInProgress && protectedRoutes.includes(routeName())) go('auth');
+    return;
+  }
+  if (accountChanged) resetAccountState();
+  state.authUser = user;
+  state.authenticated = true;
+  state.authResolved = true;
+  localStorage.setItem(EMAIL_KEY, user.email);
+  localStorage.setItem(ACCOUNT_KEY, nextKey);
+  updateAccountHeader();
+  if (accountChanged && protectedRoutes.includes(routeName())) {
+    window.history.replaceState({}, '', `${location.pathname}#marketplace`);
+    return router();
+  }
+  if (!wasResolved) return router();
+  if ((source === 'SIGNED_IN' || (source === 'TOKEN_REFRESHED' && !authRecoveryPromise)) && routeName() === 'auth') go('marketplace');
+}
+
 function router() {
-  const route = location.hash.slice(1) || 'home';
+  const route = routeName();
+  const previousRoute = state.activeRoute;
+  if (previousRoute === 'session' && route !== 'session') leaveLiveSession();
+  else if (previousRoute === 'match' && !['match', 'session'].includes(route)) endLocalCall();
+  state.activeRoute = route;
   if (route === 'auth') return window.renderAuthPage();
-  const protectedRoutes = ['onboarding', 'marketplace', 'search', 'match', 'session', 'feedback', 'dashboard', 'activity'];
+  if (protectedRoutes.includes(route) && !state.authResolved) return renderAccountLoading();
   if (protectedRoutes.includes(route) && !localStorage.getItem(EMAIL_KEY)) return window.renderAuthPage();
-  const active = readJson('mocksyra-active-match', null);
+  if (route === 'match' && roomIdFromHash()) {
+    const requestedMatch = state.activeMatches.find(item => item.roomId === roomIdFromHash());
+    if (requestedMatch) selectMatch(requestedMatch);
+    else if (!state.restored || !state.profile) {
+      root.innerHTML = frame('<section class="simple-page"><section class="panel"><p class="page-subtitle" role="status">Loading this interview…</p></section></section>');
+      connectSocket();
+      return;
+    } else {
+      toast('That interview is no longer in your active schedule.');
+      return go('marketplace');
+    }
+  }
+  const active = readJson(ACTIVE_MATCH_KEY, null);
   if (!state.match && active) { state.match = active; state.roomId = active.roomId; }
   const routes = { onboarding, marketplace, search, match, session, feedback, dashboard, activity };
   (routes[route] || home)();
@@ -731,19 +1370,17 @@ function router() {
 window.navigateMocksyra = route => { if (location.hash === `#${route}`) router(); else go(route); };
 
 window.addEventListener('hashchange', router);
+window.addEventListener('mocksyra-auth-user', event => {
+  if (event.detail?.accessToken) socket.auth = { accessToken: event.detail.accessToken };
+  applyAuthenticatedUser(event.detail?.user || null, event.detail?.source || '');
+});
 async function restoreAuthentication() {
   try {
     const { data } = await window.peerSupabase.auth.getSession();
-    const user = data.session?.user;
-    if (user?.email) {
-      state.authUser = user;
-      state.authenticated = true;
-      localStorage.setItem(EMAIL_KEY, user.email);
-      if (location.hash === '#auth') go('marketplace');
-      else router();
-    }
+    applyAuthenticatedUser(data.session?.user || null, 'RESTORED');
   } catch {
-    /* Keep the current view usable if Supabase is temporarily unavailable. */
+    state.authResolved = true;
+    if (protectedRoutes.includes(routeName())) go('auth');
   }
 }
 router();

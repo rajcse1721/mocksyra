@@ -3,7 +3,7 @@
   const initialUrl = new URL(window.location.href);
   const initialHash = initialUrl.hash;
   const initialHashParams = new URLSearchParams(initialHash.replace(/^#/, ''));
-  const returnedFromAuth = initialUrl.searchParams.has('code') || /(?:^#|[&#])(?:access_token|refresh_token)=/.test(initialHash);
+  let authReturnPending = initialUrl.searchParams.has('code') || /(?:^#|[&#])(?:access_token|refresh_token)=/.test(initialHash);
   const callbackError = initialUrl.searchParams.get('error_description') || initialHashParams.get('error_description') || initialUrl.searchParams.get('error') || initialHashParams.get('error');
   let pendingError = callbackError ? 'Google sign-in was cancelled or could not be completed. Please try again.' : '';
 
@@ -15,14 +15,22 @@
   }
 
   function storeSession(session, source) {
-    const email = session?.user?.email;
+    const user = session?.user || null;
+    const email = user?.email;
+    const previousEmail = localStorage.getItem(EMAIL_KEY) || '';
+    if (email && previousEmail && previousEmail.toLowerCase() !== email.toLowerCase()) window.__mocksyraPreviousAccountEmail = previousEmail;
+    window.__mocksyraAuthUser = user;
+    window.__mocksyraAccessToken = session?.access_token || '';
+    window.dispatchEvent(new CustomEvent('mocksyra-auth-user', { detail: { user, source, accessToken: session?.access_token || '' } }));
     if (!email) {
       if (source === 'SIGNED_OUT' || source === 'RESTORED') localStorage.removeItem(EMAIL_KEY);
       return;
     }
     localStorage.setItem(EMAIL_KEY, email);
     const entryRoute = ['', '#home', '#auth'].includes(window.location.hash);
-    if (returnedFromAuth || ((source === 'INITIAL_SESSION' || source === 'RESTORED') && entryRoute)) openMarketplace();
+    const openFromAuthReturn = authReturnPending;
+    if (openFromAuthReturn) authReturnPending = false;
+    if (openFromAuthReturn || ((source === 'INITIAL_SESSION' || source === 'RESTORED') && entryRoute)) openMarketplace();
   }
 
   if (pendingError) window.history.replaceState({}, '', `${window.location.pathname}#auth`);
@@ -37,7 +45,7 @@
       storeSession(data.session, 'RESTORED');
     })
     .catch(() => {
-      if (returnedFromAuth) pendingError = 'We could not finish signing you in. Please try again.';
+      if (authReturnPending) pendingError = 'We could not finish signing you in. Please try again.';
     });
 
   function friendlyError(error, action) {
@@ -141,7 +149,7 @@
           message('Check your email and confirm your account. Then you can sign in.');
           return;
         }
-        localStorage.setItem(EMAIL_KEY, result.data.session.user.email || email);
+        storeSession(result.data.session, 'SIGNED_IN');
         message('Signed in. Opening sessions…');
         window.connectMocksyraSocket?.();
         openMarketplace();
