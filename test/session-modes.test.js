@@ -1,6 +1,6 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { compatibility, publicMatch, historyFor, app } = require('../server');
+const { compatibility, publicMatch, historyFor, app, normalizedWebOrigin } = require('../server');
 const { compatibleModes, sessionDetails, currentQuestion, canUseRoom, validFeedback, finishFeedback } = require('../session-rules');
 
 const first = { email: 'candidate@example.test', name: 'Ada', languages: ['JavaScript'], slots: ['2030-01-01T10:00:00.000Z'], interviewType: 'Frontend', experience: 'Intermediate', spokenLanguage: 'English' };
@@ -18,6 +18,12 @@ function interview(mode = 'directed', status = 'matched') {
     questions, interviewType: 'Frontend', sharedSlot: first.slots[0], score: 80, feedback: {}
   };
 }
+
+test('configured browser origins are normalized for Socket.IO CORS', () => {
+  assert.equal(normalizedWebOrigin(' https://mocksyra.netlify.app/ '), 'https://mocksyra.netlify.app');
+  assert.equal(normalizedWebOrigin('http://localhost:3000/anything'), 'http://localhost:3000');
+  assert.equal(normalizedWebOrigin('not-an-origin'), '');
+});
 
 test('only candidate and interviewer are complementary roles', () => {
   const allowed = new Set(['candidate:interviewer', 'interviewer:candidate']);

@@ -1,8 +1,7 @@
 const root = document.querySelector('#app');
 const socket = io((['localhost', '127.0.0.1'].includes(location.hostname) ? location.origin : window.MOCKSYRA_SOCKET_URL) || location.origin, {
   autoConnect: false,
-  timeout: 90000,
-  transports: ['websocket', 'polling']
+  timeout: 90000
 });
 
 const PROFILE_KEY = 'mocksyra-profile';
@@ -39,6 +38,7 @@ const state = {
   listings: [],
   serverNow: null,
   dailyCall: null,
+  dailyPreparation: 0,
   liveRoomId: null,
   callGeneration: 0,
   workspace: { code: '', language: 'JavaScript', version: 0 },
@@ -318,8 +318,11 @@ function connectSocket() {
       const cancel = () => finish(false);
       const onConnect = () => finish(true);
       const onError = error => {
-        if (attempt === connectionAttempt && error.message !== 'Authentication required') toast('Connection unavailable. Your preferences are saved; please retry.');
-        finish(false);
+        if (error.message === 'Authentication required' || !socket.active) return finish(false);
+        // A sleeping hosted service can reject the first transport while it is
+        // waking up. Socket.IO will retry automatically, so keep this promise
+        // pending and let callers wait for the recovered connection.
+        if (attempt === connectionAttempt) toast('Connecting to the interview server… This can take a moment the first time.');
       };
       const timeout = setTimeout(() => {
         if (attempt === connectionAttempt) toast('The server is taking a little longer. Please retry.');
@@ -764,7 +767,7 @@ function session() {
   const roomId = state.roomId;
   const peer = state.match.peer, question = state.match.question || {};
   const minutes = sessionMinutes(), initialTimer = `${minutes}:00`;
-  const videoSurface = dailySession ? `<div class="call-stage daily-call-stage tool-panel" id="video-panel"><div class="call-top"><span class="live">● HOSTED VIDEO</span><span id="timer">${initialTimer}</span></div><p class="daily-status" id="daily-status">Preparing your private video room…</p><div class="daily-container" id="daily-container"></div><div class="daily-finish"><button class="call-action end" id="complete"><b>×</b><span>Finish interview</span></button></div></div>` : `<div class="call-stage tool-panel" id="video-panel"><div class="call-top"><span class="live">● LIVE SESSION</span><span id="timer">${initialTimer}</span></div>
+  const videoSurface = dailySession ? `<div class="call-stage daily-call-stage tool-panel" id="video-panel"><div class="call-top"><span class="live">● HOSTED VIDEO</span><span id="timer">${initialTimer}</span></div><div class="daily-status" id="daily-status"><span class="daily-status-message" role="status" aria-live="polite">Preparing your private video room…</span></div><div class="daily-container" id="daily-container"></div><div class="daily-finish"><button class="call-action end" id="complete"><b>×</b><span>Finish interview</span></button></div></div>` : `<div class="call-stage tool-panel" id="video-panel"><div class="call-top"><span class="live">● LIVE SESSION</span><span id="timer">${initialTimer}</span></div>
         <div class="connection-banner" id="connection"><i></i><span>Waiting for ${escapeHtml(peer.name)} to join the room…</span></div>
         <div class="call-users"><div class="video"><video id="local" autoplay muted playsinline></video><small>You</small></div><div class="video"><video id="remote" autoplay playsinline></video><small id="peer-status">${escapeHtml(peer.name)} · not connected</small></div></div>
         <div class="call-controls"><button class="call-action" id="mic" title="Toggle microphone"><b>●</b><span>Microphone</span></button><button class="call-action" id="cam" title="Toggle camera"><b>◉</b><span>Camera</span></button><button class="call-action end" id="complete" title="Finish interview"><b>×</b><span>Finish</span></button></div></div>`;
@@ -786,7 +789,7 @@ function session() {
     root.querySelector('#mic').onclick = event => toggleTrack('audio', event.currentTarget);
     root.querySelector('#cam').onclick = event => toggleTrack('video', event.currentTarget);
   }
-  root.querySelector('#complete').onclick = () => { if (confirm('Finish the interview for both participants and open feedback?')) socket.emit('complete-session', roomId); };
+  root.querySelector('#complete').onclick = event => { if (confirm('Finish the interview for both participants and open feedback?')) finishCurrentSession(roomId, event.currentTarget); };
 }
 
 async function joinCurrentCallRoom(roomId, generation) {
@@ -807,68 +810,137 @@ async function joinCurrentCallRoom(roomId, generation) {
   return joined;
 }
 
+async function disposeDailyCall(call, timeoutMs = 1200) {
+  if (!call) return;
+  let timer;
+  try {
+    await Promise.race([
+      Promise.resolve().then(() => call.leave()).catch(() => {}),
+      new Promise(resolve => { timer = setTimeout(resolve, timeoutMs); })
+    ]);
+  } finally {
+    clearTimeout(timer);
+    try { call.destroy(); } catch {}
+  }
+}
+
+function setDailyStatus(status, message, tone = '') {
+  if (!status) return;
+  status.className = `daily-status${tone ? ` ${tone}` : ''}`;
+  const copy = document.createElement('span');
+  copy.className = 'daily-status-message';
+  copy.setAttribute('role', 'status'); copy.setAttribute('aria-live', 'polite');
+  copy.textContent = message;
+  status.replaceChildren(copy);
+}
+
 async function prepareDailyCall() {
-  const roomId = state.roomId, generation = state.callGeneration;
-  const isCurrent = call => generation === state.callGeneration && state.roomId === roomId && routeName() === 'session' && (!call || state.dailyCall === call);
+  const roomId = state.roomId, generation = state.callGeneration, attempt = ++state.dailyPreparation;
   const status = root.querySelector('#daily-status'), container = root.querySelector('#daily-container');
-  if (!window.DailyIframe) { status.textContent = 'The hosted video component could not load. Check your connection and refresh.'; status.classList.add('error'); return; }
+  const sameSession = () => generation === state.callGeneration && state.roomId === roomId && routeName() === 'session' && status?.isConnected && container?.isConnected;
+  const isCurrent = call => attempt === state.dailyPreparation && sameSession() && (!call || state.dailyCall === call);
+  const releaseLiveMembership = () => {
+    if (state.liveRoomId !== roomId) return;
+    state.liveRoomId = null;
+    if (socket.connected) socket.emit('leave-session', roomId);
+  };
+  let failed = false;
+  if (!window.DailyIframe) { setDailyStatus(status, 'The hosted video component could not load. Check your connection and refresh.', 'error'); return; }
+  const showRetry = message => {
+    if (!isCurrent()) return;
+    failed = true;
+    releaseLiveMembership();
+    setDailyStatus(status, message, 'error');
+    const actions = document.createElement('span'); actions.className = 'daily-status-actions';
+    const retry = document.createElement('button'); retry.type = 'button'; retry.className = 'daily-retry'; retry.textContent = 'Retry video';
+    const schedule = document.createElement('button'); schedule.type = 'button'; schedule.className = 'daily-retry secondary'; schedule.textContent = 'Back to schedule';
+    retry.onclick = async () => {
+      if (!isCurrent()) return;
+      state.dailyPreparation += 1;
+      retry.disabled = true; schedule.disabled = true;
+      setDailyStatus(status, 'Reconnecting to your private room…');
+      const currentCall = state.dailyCall;
+      releaseLiveMembership();
+      if (currentCall) {
+        state.dailyCall = null;
+        await disposeDailyCall(currentCall);
+      }
+      if (sameSession()) prepareDailyCall();
+    };
+    schedule.onclick = () => { if (isCurrent()) go('match'); };
+    actions.append(retry, schedule); status.append(actions);
+  };
+  setDailyStatus(status, 'Connecting to your private video room… The first connection can take up to a minute.');
+  const connected = await connectSocket();
+  if (!isCurrent()) return;
+  if (!connected) return showRetry('We could not reach the interview server. It may still be waking up—wait a moment and try again.');
+  setDailyStatus(status, 'Preparing secure room access…');
   const access = await request('prepare-call', { roomId }, 30_000);
   if (!isCurrent()) { if (access) access.token = ''; return; }
-  if (!access.ok) { status.textContent = access.error; status.classList.add('error'); return; }
+  if (!access.ok) { showRetry(access.error || 'The private room is not available yet.'); return; }
   if (access.provider !== 'daily') {
     state.match.videoProvider = 'webrtc';
-    status.textContent = 'Using the browser video fallback…';
+    setDailyStatus(status, 'Using the browser video fallback…');
     if (await ensureMedia() && isCurrent()) session();
     return;
   }
-  const call = window.DailyIframe.createFrame(container, {
-    showLeaveButton: true,
-    iframeStyle: { width: '100%', height: '100%', border: '0', borderRadius: '8px' }
-  });
+  let call;
+  try {
+    call = window.DailyIframe.createFrame(container, {
+      showLeaveButton: true,
+      iframeStyle: { width: '100%', height: '100%', border: '0', borderRadius: '8px' }
+    });
+  } catch {
+    showRetry('Could not start the hosted video panel. Close any other open interview tab and try again.');
+    return;
+  }
   state.dailyCall = call;
   call.on('joined-meeting', async () => {
     if (!isCurrent(call)) {
-      Promise.resolve(call.leave()).catch(() => {}).finally(() => { try { call.destroy(); } catch {} });
+      disposeDailyCall(call);
       return;
     }
-    status.textContent = 'Verifying this interview room…';
+    if (failed) return;
+    setDailyStatus(status, 'Verifying this interview room…');
     const joined = await joinCurrentCallRoom(roomId, generation);
     if (!isCurrent(call)) {
-      Promise.resolve(call.leave()).catch(() => {}).finally(() => { try { call.destroy(); } catch {} });
+      disposeDailyCall(call);
       return;
     }
+    if (failed) { releaseLiveMembership(); return; }
     if (!joined.ok) {
       if (state.liveRoomId === roomId) state.liveRoomId = null;
       if (state.dailyCall === call) state.dailyCall = null;
-      status.textContent = joined.error; status.classList.add('error');
-      Promise.resolve(call.leave()).catch(() => {}).finally(() => { try { call.destroy(); } catch {} });
+      showRetry(joined.error || 'This interview room is not available yet.');
+      disposeDailyCall(call);
       return;
     }
-    status.textContent = 'Secure video connected.'; status.classList.add('ready');
+    setDailyStatus(status, 'Secure video connected.', 'ready');
     if (joined.startedAt) startSyncedTimer(joined.startedAt);
     socket.emit('workspace-request', roomId);
   });
   call.on('left-meeting', () => {
-    const wasCurrent = state.dailyCall === call;
+    const wasCurrent = isCurrent(call);
+    if (!wasCurrent) { try { call.destroy(); } catch {}; return; }
     if (state.liveRoomId === roomId) {
       state.liveRoomId = null;
       if (socket.connected) socket.emit('leave-session', roomId);
     }
-    if (wasCurrent) state.dailyCall = null;
+    state.dailyCall = null;
     try { call.destroy(); } catch {}
-    if (wasCurrent && routeName() === 'session' && state.roomId === roomId) go('match');
+    if (routeName() === 'session' && state.roomId === roomId) go('match');
   });
-  call.on('error', event => { if (isCurrent(call)) { status.textContent = event?.errorMsg || 'Video connection interrupted. Please retry.'; status.classList.add('error'); } });
+  call.on('error', event => { if (isCurrent(call)) showRetry(event?.errorMsg || 'Video connection interrupted. Please retry.'); });
   try {
     await call.join({ url: access.roomUrl, token: access.token });
     access.token = '';
-    if (!isCurrent(call)) Promise.resolve(call.leave()).catch(() => {}).finally(() => { try { call.destroy(); } catch {} });
+    if (!isCurrent(call)) disposeDailyCall(call);
   } catch {
     access.token = '';
     if (isCurrent(call)) {
       state.dailyCall = null;
-      status.textContent = 'Could not enter the hosted video room. Please refresh and retry.'; status.classList.add('error');
-      try { call.destroy(); } catch {}
+      showRetry('Could not enter the hosted video room. Check camera permission and try again.');
+      disposeDailyCall(call);
     }
   }
 }
@@ -947,15 +1019,38 @@ function updateConnection(text, ready) {
   if (banner) { banner.classList.toggle('ready', ready); banner.querySelector('span').textContent = ready ? 'Secure video connected' : text; }
 }
 
+async function finishCurrentSession(roomId, button) {
+  const generation = state.callGeneration;
+  const isCurrent = () => routeName() === 'session' && state.roomId === roomId && state.callGeneration === generation;
+  const label = button?.querySelector('span'), previousLabel = label?.textContent || 'Finish';
+  if (button) button.disabled = true;
+  if (label) label.textContent = 'Finishing…';
+  const restoreButton = message => {
+    if (!isCurrent()) return;
+    if (button) button.disabled = false;
+    if (label) label.textContent = previousLabel;
+    toast(message);
+  };
+  if (!(await connectSocket())) return restoreButton('Could not reach the interview server. Please retry.');
+  if (!isCurrent()) return;
+  const joined = await joinCurrentCallRoom(roomId, generation);
+  if (!isCurrent()) return;
+  if (!joined.ok) return restoreButton(joined.error || 'Could not verify this interview room.');
+  const result = await request('complete-session', roomId);
+  if (!isCurrent()) return;
+  if (!result.ok) restoreButton(result.error || 'Could not finish the interview. Please retry.');
+}
+
 function startSyncedTimer(startedAt) {
-  clearInterval(state.clock); state.sessionStartedAt = new Date(startedAt).getTime();
+  clearInterval(state.clock); state.clock = null; state.sessionStartedAt = new Date(startedAt).getTime();
   const update = () => {
     const elapsed = Math.max(0, Math.floor((Date.now() - state.sessionStartedAt) / 1000)), totalSeconds = sessionMinutes() * 60, remaining = Math.max(0, totalSeconds - elapsed);
     const value = `${Math.floor(remaining / 60)}:${String(remaining % 60).padStart(2, '0')}`;
     const timer = root.querySelector('#timer'), side = root.querySelector('#side-timer'); if (timer) timer.textContent = value; if (side) side.textContent = value;
-    if (!remaining) socket.emit('complete-session', state.roomId);
+    if (!remaining && state.clock) { clearInterval(state.clock); state.clock = null; }
+    return remaining;
   };
-  update(); state.clock = setInterval(update, 1000);
+  if (update()) state.clock = setInterval(update, 1000);
 }
 
 function bindWorkspace() {
@@ -998,10 +1093,11 @@ function renderChat() {
 
 function endLocalCall() {
   state.callGeneration += 1;
+  state.dailyPreparation += 1;
   clearInterval(state.clock); clearInterval(state.joinClock);
   state.stream?.getTracks().forEach(track => track.stop()); state.pc?.close(); state.stream = null; state.pc = null;
   const daily = state.dailyCall; state.dailyCall = null;
-  if (daily) { Promise.resolve(daily.leave()).catch(() => {}).finally(() => { try { daily.destroy(); } catch {} }); }
+  if (daily) disposeDailyCall(daily);
 }
 
 function leaveLiveSession(notifyServer = true) {
@@ -1163,7 +1259,14 @@ socket.on('profile-state', restored => {
   applyScheduleResponse(restored);
   const refreshedSelected = state.activeMatches.find(item => item.roomId === state.roomId);
   if (refreshedSelected) selectMatch(refreshedSelected);
-  else if (state.match && hasSchedule && !['#feedback', '#dashboard'].includes(location.hash)) clearActiveMatch(state.roomId);
+  else if (state.match && hasSchedule && !['#feedback', '#dashboard'].includes(location.hash)) {
+    const removedRoute = routeName();
+    clearActiveMatch(state.roomId);
+    if (['match', 'session'].includes(removedRoute)) {
+      toast('That interview is no longer in your active schedule.');
+      return go('marketplace');
+    }
+  }
   else if (!state.match && restored?.activeMatch) selectMatch(restored.activeMatch);
   if (Array.isArray(restored?.history)) state.history = restored.history;
   if (Array.isArray(restored?.notifications)) state.notifications = restored.notifications;
@@ -1200,7 +1303,11 @@ socket.on('session-ready', async packet => {
   if (roomId !== state.roomId) { if (location.hash === '#marketplace') renderYourSchedule(); return; }
   if (scheduled) selectMatch({ ...scheduled, status: 'in_progress', startedAt: packet.startedAt || scheduled.startedAt });
   if (packet.startedAt) startSyncedTimer(packet.startedAt);
-  if (state.match?.videoProvider === 'daily') { const status = root.querySelector('#daily-status'); if (status) { status.textContent = 'Both participants are here. Your session has started.'; status.classList.add('ready'); } return; }
+  if (state.match?.videoProvider === 'daily') {
+    const status = root.querySelector('#daily-status');
+    if (!status?.classList.contains('error')) setDailyStatus(status, 'Both participants are here. Your session has started.', 'ready');
+    return;
+  }
   const pc = state.pc, generation = state.callGeneration;
   if (!pc) return;
   const isCurrent = () => state.pc === pc && state.roomId === roomId && state.callGeneration === generation && routeName() === 'session';

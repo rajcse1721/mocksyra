@@ -16,7 +16,7 @@ Deploy the backend before the frontend so the new schedule UI always talks to a 
 
 2. Run the complete current `supabase-schema.sql` file. It is safe to run again.
 3. Temporarily lock or pause Netlify production publishing, then commit and push this version to the connected branch. This prevents Netlify from publishing the new frontend before Render is ready.
-4. In Render, confirm `FRONTEND_ORIGIN`, `APP_URL`, `SUPABASE_SECRET_KEY`, and (for hosted video) `DAILY_API_KEY`, then deploy the latest commit.
+4. In Render, confirm `FRONTEND_ORIGIN`, `APP_URL`, `SUPABASE_SECRET_KEY`, and (for hosted video) `DAILY_API_KEY`, then deploy the latest commit. `FRONTEND_ORIGIN` must be `https://mocksyra.netlify.app` without a trailing slash.
 5. Open `https://YOUR-RENDER-SERVICE.onrender.com/health`. For the intended hosted setup it should report all three values:
 
    ```json
@@ -92,8 +92,8 @@ If the Netlify site does not exist yet, initially use its temporary/future name,
 
 2. Commit and push the change.
 3. In Netlify choose Add new site -> Import an existing project.
-4. Build command: leave empty.
-5. Publish directory: `.`
+4. Build command: `npm run build:static` (also configured in `netlify.toml`).
+5. Publish directory: `dist` (also configured in `netlify.toml`). This publishes only browser assets and keeps server source, tests, schema files, and deployment notes private.
 6. Deploy. If Netlify assigned a different origin, update Render's `FRONTEND_ORIGIN` and `APP_URL`, Supabase Auth's Site URL and Redirect URLs, and Google's Authorized JavaScript origin. The Supabase project API URL itself does not change with the Netlify domain.
 
 ## 4. Optional match email

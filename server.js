@@ -16,12 +16,19 @@ const JOIN_GRACE_MS = 15 * 60 * 1000;
 const SCHEDULE_BLOCK_MS = SESSION_DURATION_MS + JOIN_GRACE_MS;
 const MAX_OPEN_LISTINGS = 4;
 const MAX_UPCOMING_MATCHES = 4;
-const allowedOrigins = (process.env.FRONTEND_ORIGIN || '').split(',').map(origin => origin.trim()).filter(Boolean);
+function normalizedWebOrigin(value) {
+  try {
+    const url = new URL(String(value || '').trim());
+    return ['http:', 'https:'].includes(url.protocol) ? url.origin : '';
+  } catch { return ''; }
+}
+const configuredOrigins = (process.env.FRONTEND_ORIGIN || '').split(',').map(origin => origin.trim()).filter(Boolean);
+const allowedOrigins = configuredOrigins.map(normalizedWebOrigin).filter(Boolean);
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: allowedOrigins.length ? allowedOrigins : true, methods: ['GET', 'POST'] },
+  cors: { origin: configuredOrigins.length ? allowedOrigins : true, methods: ['GET', 'POST'] },
   maxHttpBufferSize: 25_000
 });
 
@@ -801,15 +808,17 @@ io.on('connection', socket => {
     if (match.status === 'matched' && !joinWindow(match).canJoinNow) return reject(socket, callback, `This room opens 10 minutes before ${new Date(match.sharedSlot).toLocaleString('en', { timeZone: 'UTC' })} UTC.`);
     if (match.status === 'in_progress') scheduleSessionTimers(match);
     if (match.status !== 'matched' && match.status !== 'in_progress') return reject(socket, callback, 'This interview has ended. Please share your feedback.');
+    const wasJoined = socket.rooms.has(roomId);
     socket.join(roomId);
     const peer = match.people.find(person => person.email !== email);
-    emitToEmail(peer.email, 'peer-entered-room', { roomId });
+    if (!wasJoined) emitToEmail(peer.email, 'peer-entered-room', { roomId });
     const participants = roomParticipantEmails(roomId);
     if (participants.size >= 2) {
-      if (!match.sessionStartedAt) match.sessionStartedAt = new Date().toISOString();
+      const startedNow = !match.sessionStartedAt;
+      if (startedNow) match.sessionStartedAt = new Date().toISOString();
       match.status = 'in_progress'; save();
       scheduleSessionTimers(match);
-      emitSessionState(match, 'session-ready');
+      if (startedNow || !wasJoined) emitSessionState(match, 'session-ready');
     }
     acknowledge(callback, { ok: true, ...sessionDetails(match, email), question: currentQuestion(match, email, Date.now(), questionFor(match.interviewType, 0)) });
   });
@@ -911,4 +920,4 @@ async function start() {
 }
 
 if (require.main === module) start();
-module.exports = { app, server, compatibility, sharedSlots, sharedSkills, questionFor, publicMatch, historyFor };
+module.exports = { app, server, compatibility, sharedSlots, sharedSkills, questionFor, publicMatch, historyFor, normalizedWebOrigin };

@@ -104,7 +104,8 @@ function fakeSupabaseSDK() {
 }
 
 function fakeSocketSDK() {
-  window.io = () => {
+  window.io = (...argumentsList) => {
+    window.__fixtureSocketOptions = argumentsList[1] || {};
     const listeners = new Map();
     const accountData = new Map();
     let connectedEmail = '';
@@ -262,14 +263,21 @@ function fakeSocketSDK() {
 
 function fakeDailySDK() {
   window.DailyIframe = { createFrame(container) {
+    if (window.__fixtureDailyCreateError) {
+      window.__fixtureDailyCreateError = false;
+      throw new Error('Fixture Daily frame creation failed');
+    }
     const listeners = new Map();
     const surface = document.createElement('div'); surface.className = 'daily-fixture-surface'; surface.textContent = 'Hosted video preview'; container.append(surface);
-    return {
+    const call = {
       on(name, callback) { listeners.set(name, callback); return this; },
+      emitFixture(name, payload) { return listeners.get(name)?.(payload); },
       async join(credentials) { window.__dailyJoin = credentials; queueMicrotask(() => listeners.get('joined-meeting')?.()); },
       async leave() { window.__dailyLeaveCount = (window.__dailyLeaveCount || 0) + 1; listeners.get('left-meeting')?.(); },
       destroy() { window.__dailyDestroyCount = (window.__dailyDestroyCount || 0) + 1; surface.remove(); }
     };
+    window.__dailyCalls = [...(window.__dailyCalls || []), call];
+    return call;
   } };
 }
 
@@ -501,29 +509,95 @@ async function verifyGoogleCallback() {
 async function verifyRealtimeRecovery() {
   const page = await newPage(true, false, true);
   await page.goto(`${origin}/#marketplace`);
-  await page.waitForFunction(() => window.__mocksyraSocket?.connectCount >= 1 && !window.__mocksyraSocket.connected && document.querySelector('#marketplace-results')?.getAttribute('aria-busy') === 'false');
+  await page.waitForFunction(() => window.__mocksyraSocket?.connectCount >= 1 && !window.__mocksyraSocket.connected);
+  assert.equal(await page.evaluate(() => Object.hasOwn(window.__fixtureSocketOptions, 'transports')), false, 'Socket.IO keeps its polling-to-WebSocket fallback');
   const beforeRecovery = await page.evaluate(() => ({
     disconnects: window.__mocksyraSocket.disconnectCount,
     restores: window.__mocksyraSocket.sent.filter(item => item.event === 'restore-profile').length
   }));
-  const recovered = await page.evaluate(async () => {
+  await page.evaluate(async () => {
     const socket = window.__mocksyraSocket;
     socket.connected = true;
     socket.active = true;
+    socket.id = 'fixture-recovered-marketplace';
     await socket.receive('connect');
-    await new Promise(resolve => queueMicrotask(resolve));
-    return {
-      connected: socket.connected,
-      active: socket.active,
-      disconnects: socket.disconnectCount,
-      restores: socket.sent.filter(item => item.event === 'restore-profile').length
-    };
   });
+  await page.waitForFunction(() => window.__mocksyraSocket.connected && document.querySelector('#marketplace-results')?.getAttribute('aria-busy') === 'false');
+  const recovered = await page.evaluate(() => ({
+    connected: window.__mocksyraSocket.connected,
+    active: window.__mocksyraSocket.active,
+    disconnects: window.__mocksyraSocket.disconnectCount,
+    restores: window.__mocksyraSocket.sent.filter(item => item.event === 'restore-profile').length
+  }));
   assert.equal(recovered.connected, true, 'Socket.IO automatic recovery is accepted after a transient first failure');
   assert.equal(recovered.active, true);
   assert.equal(recovered.disconnects, beforeRecovery.disconnects, 'the recovered authenticated socket is not immediately disconnected');
   assert.equal(recovered.restores, beforeRecovery.restores + 1, 'automatic recovery restores the account schedule');
   report.checks.push('A verified socket identity survives a transient first connection failure and automatic reconnect');
+  await page.context().close();
+}
+
+async function verifyHostedVideoColdStart() {
+  const page = await newPage(true, true, true);
+  const now = Date.now();
+  const match = {
+    ...fixtureMatch('candidate'),
+    roomId: 'fixture-daily-cold-start',
+    videoProvider: 'daily',
+    sharedSlot: new Date(now + 5 * 60 * 1000).toISOString(),
+    opensAt: new Date(now - 5 * 60 * 1000).toISOString(),
+    closesAt: new Date(now + 20 * 60 * 1000).toISOString(),
+    serverNow: new Date(now).toISOString(),
+    canJoinNow: true
+  };
+  await page.addInitScript(matchData => {
+    localStorage.setItem('mocksyra-profile', JSON.stringify({ email: 'fixture@example.test', name: 'Booking alias', practiceMode: 'candidate' }));
+    localStorage.setItem('mocksyra-active-match', JSON.stringify(matchData));
+    localStorage.setItem('mocksyra-active-matches', JSON.stringify([matchData]));
+  }, match);
+  await page.goto(`${origin}/#session`);
+  await page.waitForFunction(() => window.__mocksyraSocket?.connectCount >= 1 && !window.__mocksyraSocket.connected);
+  assert.match(await page.locator('#daily-status').innerText(), /connecting to your private video room/i);
+  assert.equal(await page.evaluate(() => window.__mocksyraSocket.sent.some(item => item.event === 'prepare-call')), false, 'room credentials wait for a connected authenticated socket');
+  await page.evaluate(async matchData => {
+    const socket = window.__mocksyraSocket;
+    socket.activeMatches = [matchData];
+    socket.connected = true;
+    socket.active = true;
+    socket.id = 'fixture-recovered-cold-start';
+    await socket.receive('connect');
+  }, match);
+  await page.waitForFunction(() => Boolean(window.__dailyJoin));
+  assert.equal(await page.evaluate(() => window.__mocksyraSocket.sent.filter(item => item.event === 'prepare-call').length), 1, 'room credentials are requested once after automatic reconnect');
+  assert.match(await page.locator('#daily-status').innerText(), /connected/i);
+  await page.setViewportSize({ width: 390, height: 844 });
+  await checkOverflow(page, 'hosted video cold-start mobile');
+  await screenshot(page, 'session-daily-cold-start-mobile');
+  report.checks.push('A direct hosted-session load waits through a transient Render cold start before requesting Daily credentials');
+  await page.context().close();
+}
+
+async function verifyStaleHostedRestore() {
+  const page = await newPage(true, true);
+  const now = Date.now();
+  const match = {
+    ...fixtureMatch('interviewer'),
+    roomId: 'fixture-stale-daily-session',
+    videoProvider: 'daily',
+    sharedSlot: new Date(now + 5 * 60 * 1000).toISOString(),
+    canJoinNow: true
+  };
+  await page.addInitScript(matchData => {
+    localStorage.setItem('mocksyra-profile', JSON.stringify({ email: 'fixture@example.test', name: 'Stale alias', practiceMode: 'interviewer' }));
+    localStorage.setItem('mocksyra-active-match', JSON.stringify(matchData));
+    localStorage.setItem('mocksyra-active-matches', JSON.stringify([matchData]));
+  }, match);
+  await page.goto(`${origin}/#session`);
+  await page.waitForURL('**/#marketplace');
+  await page.locator('#marketplace-results').waitFor();
+  assert.equal(await page.evaluate(() => Boolean(window.__dailyJoin)), false, 'removed bookings never receive hosted-room credentials');
+  assert.equal(await page.evaluate(() => localStorage.getItem('mocksyra-active-match')), null, 'a stale selected booking is cleared');
+  report.checks.push('A removed cached booking redirects a direct session reload back to the schedule');
   await page.context().close();
 }
 
@@ -873,8 +947,12 @@ async function verifyMode(practiceMode) {
   if (practiceMode === 'candidate') {
     const leavesBeforeSessionExit = await page.evaluate(() => window.__mocksyraSocket.sent.filter(item => item.event === 'leave-session').length);
     await page.locator('[data-tab="workspace-panel"]').click();
-    await page.locator('#shared-code').fill('stale debounce must not cross rooms');
-    await page.locator('.app-sections [data-route="marketplace"]').click();
+    await page.evaluate(() => {
+      const editor = document.querySelector('#shared-code');
+      editor.value = 'stale debounce must not cross rooms';
+      editor.dispatchEvent(new Event('input', { bubbles: true }));
+      document.querySelector('.app-sections [data-route="marketplace"]').click();
+    });
     await page.locator(`[data-open-match="${bookedRoomId}"]`).waitFor();
     await page.waitForTimeout(180);
     const exited = await page.evaluate(() => ({
@@ -906,7 +984,28 @@ async function verifyMode(practiceMode) {
   await page.waitForFunction(() => window.__mocksyraSocket.sent.some(item => item.event === 'workspace-update' && item.payload.code.includes('6 * 7')));
   await page.locator('[data-tab="video-panel"]').click();
   const leavesBeforeCompletion = await page.evaluate(() => window.__mocksyraSocket.sent.filter(item => item.event === 'leave-session').length);
-  await page.locator('#complete').click();
+  if (practiceMode === 'interviewer') {
+    const beforeOfflineFinish = await page.evaluate(() => ({
+      connects: window.__mocksyraSocket.connectCount,
+      completions: window.__mocksyraSocket.sent.filter(item => item.event === 'complete-session').length
+    }));
+    await page.evaluate(() => {
+      window.__mocksyraSocket.disconnect();
+      window.__fixtureFailInitialSocketConnect = true;
+    });
+    await page.locator('#complete').click();
+    await page.waitForFunction(connects => window.__mocksyraSocket.connectCount > connects && !window.__mocksyraSocket.connected, beforeOfflineFinish.connects);
+    assert.equal(await page.evaluate(() => window.__mocksyraSocket.sent.filter(item => item.event === 'complete-session').length), beforeOfflineFinish.completions, 'finish is not buffered before the call room reconnects');
+    await page.evaluate(async () => {
+      const socket = window.__mocksyraSocket;
+      socket.connected = true;
+      socket.active = true;
+      socket.id = 'fixture-recovered-before-finish';
+      await socket.receive('connect');
+    });
+  } else {
+    await page.locator('#complete').click();
+  }
   await page.locator('#submit').waitFor();
   const completedRoomCleanup = await page.evaluate(() => ({
     leaves: window.__mocksyraSocket.sent.filter(item => item.event === 'leave-session'),
@@ -915,6 +1014,7 @@ async function verifyMode(practiceMode) {
   assert.equal(completedRoomCleanup.leaves.length, leavesBeforeCompletion + 1, 'completion leaves one exact socket room');
   assert.equal(completedRoomCleanup.leaves.at(-1).payload, bookedRoomId);
   assert.equal(completedRoomCleanup.joinedRooms.includes(bookedRoomId), false, 'completed room membership is removed before feedback');
+  assert.equal(await page.evaluate(() => window.__mocksyraSocket.sent.filter(item => item.event === 'complete-session').length), 1, 'finishing sends one acknowledged completion request');
   const feedbackText = await page.locator('.feedback-card').innerText();
   if (practiceMode === 'candidate') assert.match(feedbackText, /Question clarity/i);
   else assert.match(feedbackText, /Problem solving/i);
@@ -949,6 +1049,31 @@ async function verifyHostedVideo() {
   assert.equal(await page.evaluate(() => [...Array(localStorage.length)].map((_, index) => localStorage.getItem(localStorage.key(index))).some(value => value?.includes('short-lived-fixture-token'))), false, 'Daily token is never persisted');
   assert.equal(await page.locator('#local').count(), 0, 'Daily owns camera and microphone capture');
   assert.match(await page.locator('#daily-status').innerText(), /connected/i);
+  const callsBeforeRetry = await page.evaluate(() => window.__dailyCalls.length);
+  await page.evaluate(() => window.__dailyCalls[0].emitFixture('error', { errorMsg: 'Temporary hosted video interruption.' }));
+  await page.locator('.daily-retry').first().waitFor();
+  await page.evaluate(roomId => window.__mocksyraSocket.receive('session-ready', { roomId, startedAt: new Date().toISOString() }), bookedRoomId);
+  assert.equal(await page.locator('.daily-retry').count(), 2, 'socket readiness does not hide hosted-video recovery controls');
+  assert.match(await page.locator('#daily-status').getAttribute('class'), /error/);
+  await page.evaluate(() => { window.__fixtureDailyCreateError = true; });
+  await page.locator('.daily-retry:not(.secondary)').click();
+  await page.waitForFunction(() => /could not start the hosted video panel/i.test(document.querySelector('#daily-status')?.textContent || ''));
+  assert.equal(await page.locator('.daily-retry').count(), 2, 'frame creation failure stays recoverable without a page refresh');
+  await page.locator('.daily-retry:not(.secondary)').click();
+  await page.waitForFunction(previous => window.__dailyCalls.length === previous + 1 && /connected/i.test(document.querySelector('#daily-status')?.textContent || ''), callsBeforeRetry);
+  const beforeStaleLeave = await page.evaluate(() => ({
+    leaves: window.__mocksyraSocket.sent.filter(item => item.event === 'leave-session').length,
+    joinedRooms: [...window.__mocksyraSocket.joinedRooms]
+  }));
+  await page.evaluate(() => window.__dailyCalls[0].emitFixture('left-meeting'));
+  const afterStaleLeave = await page.evaluate(() => ({
+    route: location.hash,
+    leaves: window.__mocksyraSocket.sent.filter(item => item.event === 'leave-session').length,
+    joinedRooms: [...window.__mocksyraSocket.joinedRooms]
+  }));
+  assert.equal(afterStaleLeave.route, '#session', 'a stale Daily callback cannot close the replacement call');
+  assert.equal(afterStaleLeave.leaves, beforeStaleLeave.leaves, 'a stale Daily callback cannot evict the replacement socket room');
+  assert.deepEqual(afterStaleLeave.joinedRooms, beforeStaleLeave.joinedRooms);
   await page.setViewportSize({ width: 390, height: 844 });
   await checkOverflow(page, 'hosted video mobile'); await screenshot(page, 'session-daily-mobile');
   const leavesBeforeExit = await page.evaluate(() => window.__mocksyraSocket.sent.filter(item => item.event === 'leave-session').length);
@@ -984,6 +1109,7 @@ async function verifyHostedVideo() {
   assert.equal(rejectedJoin.route, '#session');
   assert.match(rejectedJoin.status, /finish your current live interview/i);
   assert.equal(rejectedJoin.surfaces, 0, 'a rejected backend admission destroys the Daily surface');
+  assert.equal(await page.locator('.daily-retry').count(), 2, 'rejected admission offers retry and back-to-schedule actions');
   assert.equal(rejectedJoin.leaves, beforeRejectedJoin.leaves + 1, 'a timed-out or rejected admission defensively leaves the socket room');
   assert.ok(rejectedJoin.dailyLeaves > beforeRejectedJoin.dailyLeaves && rejectedJoin.dailyDestroys > beforeRejectedJoin.dailyDestroys, 'a rejected backend admission releases Daily media');
   report.checks.push('Daily Prebuilt uses short-lived credentials and releases both Daily and socket rooms on navigation or rejected admission');
@@ -1019,7 +1145,7 @@ async function verifyHistory() {
   origin = `http://127.0.0.1:${server.address().port}`;
   try {
     browser = await playwright.chromium.launch({ channel: process.env.MOCKSYRA_BROWSER_CHANNEL || 'chrome', headless: true });
-    for (const [name, run] of [['guest', verifyGuest], ['google-callback', verifyGoogleCallback], ['realtime-recovery', verifyRealtimeRecovery], ['auth-handshake-recovery', verifyAuthHandshakeRecovery], ['logout-failure', verifyLogoutFailure], ['auth-lifecycle', verifyAuthLifecycle], ['webrtc-rejection', verifyRejectedWebRtcAdmission], ...['candidate', 'interviewer'].map(mode => [mode, () => verifyMode(mode)]), ['hosted-video', verifyHostedVideo], ['history', verifyHistory]]) {
+    for (const [name, run] of [['guest', verifyGuest], ['google-callback', verifyGoogleCallback], ['realtime-recovery', verifyRealtimeRecovery], ['hosted-video-cold-start', verifyHostedVideoColdStart], ['stale-hosted-restore', verifyStaleHostedRestore], ['auth-handshake-recovery', verifyAuthHandshakeRecovery], ['logout-failure', verifyLogoutFailure], ['auth-lifecycle', verifyAuthLifecycle], ['webrtc-rejection', verifyRejectedWebRtcAdmission], ...['candidate', 'interviewer'].map(mode => [mode, () => verifyMode(mode)]), ['hosted-video', verifyHostedVideo], ['history', verifyHistory]]) {
       try { await run(); process.stdout.write(`PASS ${name}\n`); }
       catch (error) { report.errors.push(`${name}: ${error.stack}`); process.stderr.write(`FAIL ${name}: ${error.message}\n`); }
     }
